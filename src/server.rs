@@ -9,6 +9,12 @@ use crate::db::Store;
 /// Upper bound on rows returned by the history tools, so a client cannot ask for everything.
 const MAX_HISTORY_ROWS: i64 = 100;
 
+/// Clamp a client-supplied history limit into `1..=MAX_HISTORY_ROWS`.
+#[must_use]
+pub fn clamp_history_limit(limit: i64) -> i64 {
+    limit.clamp(1, MAX_HISTORY_ROWS)
+}
+
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 pub struct DivisionRequest {
     #[schemars(description = "The dividend")]
@@ -33,6 +39,21 @@ impl Calculator {
     #[must_use]
     pub const fn new(store: Store) -> Self {
         Self { store }
+    }
+
+    /// Names of every tool this server exposes, sorted.
+    ///
+    /// The underlying registry is a `HashMap`, so this is the only supported way to enumerate
+    /// tools — [`ToolBox::list`](rmcp::handler::server::tool::ToolBox::list) has no defined order.
+    #[must_use]
+    pub fn tool_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Self::tool_box()
+            .list()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        names.sort_unstable();
+        names
     }
 
     #[tool(description = "Add two integers")]
@@ -98,7 +119,7 @@ impl Calculator {
 
     #[tool(description = "List previously recorded calculations, most recent first")]
     async fn calc_history(&self, #[tool(aggr)] request: HistoryRequest) -> Result<String, String> {
-        let limit = request.limit.clamp(1, MAX_HISTORY_ROWS);
+        let limit = clamp_history_limit(request.limit);
         let entries = self.store.list(limit).await?;
         if entries.is_empty() {
             return Ok("no calculations recorded yet".to_owned());
@@ -145,6 +166,10 @@ mod tests {
         Calculator::new(Store::disabled())
     }
 
+    // The tool functions themselves are private (rmcp's macro keeps them so), so these unit tests
+    // and tests/stdio_protocol.rs are complementary: these are fast and precise, the integration
+    // test drives the same tools through the real JSON-RPC protocol.
+
     #[tokio::test]
     async fn arithmetic_tools_report_results() {
         let calculator = calculator();
@@ -172,52 +197,10 @@ mod tests {
         assert_eq!(division_by_zero, Err("division by zero".to_owned()));
     }
 
-    #[tokio::test]
-    async fn arithmetic_still_works_without_storage() {
-        // The whole point of lazy storage: no DATABASE_URL must not break the calculators.
-        let calculator = calculator();
-        assert_eq!(calculator.add(1, 1).await, "1 + 1 = 2");
-    }
-
-    #[tokio::test]
-    async fn history_tools_report_disabled_storage_as_errors() {
-        let calculator = calculator();
-        assert_eq!(
-            calculator.db_status().await,
-            Err(Store::DISABLED.to_owned())
-        );
-        assert_eq!(
-            calculator.calc_history(HistoryRequest { limit: 10 }).await,
-            Err(Store::DISABLED.to_owned())
-        );
-        assert_eq!(
-            calculator.clear_calc_history().await,
-            Err(Store::DISABLED.to_owned())
-        );
-    }
-
-    #[tokio::test]
-    async fn history_limit_is_clamped_to_a_sane_range() {
-        let calculator = calculator();
-        for limit in [i64::MIN, 0, 1_000_000] {
-            let error = calculator
-                .calc_history(HistoryRequest { limit })
-                .await
-                .unwrap_err();
-            assert_eq!(error, Store::DISABLED);
-        }
-    }
-
     #[test]
-    fn tool_box_exposes_every_tool() {
-        let mut names: Vec<String> = Calculator::tool_box()
-            .list()
-            .into_iter()
-            .map(|tool| tool.name.to_string())
-            .collect();
-        names.sort_unstable();
+    fn tool_names_are_sorted_and_complete() {
         assert_eq!(
-            names,
+            calculator().tool_names(),
             [
                 "add",
                 "calc_history",

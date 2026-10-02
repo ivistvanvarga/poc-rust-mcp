@@ -2,10 +2,14 @@
 
 ## Project
 
-Single binary crate `poc-rust-mcp` (edition 2024). `src/main.rs` = CLI + transport wiring,
-`src/server.rs` = the `Calculator` server and all tools, `src/db.rs` = all PostgreSQL access,
-`migrations/` = sqlx migrations. There is **no lib target**, so `tests/*.rs` cannot
-`use poc_rust_mcp::…` — keep tests in `#[cfg(test)]` modules.
+Crate `poc-rust-mcp` (edition 2024) with **both** a lib and a bin target:
+
+- `src/lib.rs` — exposes `pub mod db` and `pub mod server` so integration tests can
+  `use poc_rust_mcp::…`.
+- `src/main.rs` — thin CLI + transport wiring (arg parsing, tracing, stdio/SSE), imports the lib
+  rather than declaring `mod` items itself.
+- `src/server.rs` — the `Calculator` server and all tools, `src/db.rs` — all PostgreSQL access,
+  `migrations/` — sqlx migrations.
 
 ## rmcp is pinned to 0.1 — the 0.1 API is not the 3.x API
 
@@ -102,11 +106,33 @@ podman-compose -f .devcontainer/compose.yaml down -v     # -v also drops the pgd
 
 ## Tests
 
-`ToolBox::list()` is backed by a `HashMap`, so tool order is **not deterministic** — sort before
-asserting. Run one test with `cargo test tool_box_exposes_every_tool`. DB tests must not require a
-live database: point at a dead port with `Store::connect_with_timeout(url, FAST)` and assert
-bounded failure instead. Recovering from a tripped breaker takes 30s by design, so it is verified
-manually, not in the suite.
+Three layers, and each assertion lives in exactly one of them — do not duplicate:
+
+- `tests/stdio_protocol.rs` spawns the **real binary** over stdio and speaks raw JSON-RPC. This is
+  the only layer that proves the protocol itself works (capabilities, `tools/list`, argument
+  validation, tool errors vs JSON-RPC errors, stdout purity).
+- `tests/store_offline.rs` exercises the public `Store`/`HistoryEntry` surface **without** a live
+  database: disabled storage, unparsable URLs, bounded failure, breaker tripping, fire-and-forget
+  writes.
+- `#[cfg(test)]` modules in `src/` keep only what needs private access (rmcp's macro makes the tool
+  fns private; the breaker internals are reachable only from inside `db.rs`).
+
+Rules for the suite:
+
+- `cargo test` must pass on a bare checkout with **no PostgreSQL running**. Point at a dead port
+  (`postgres://mcp:mcp@127.0.0.1:1/mcp`) via `Store::connect_with_timeout(url, FAST)` and assert
+  bounded failure. Live-database behaviour (inserts, `DELETE` row counts, migration
+  `VersionMismatch`) is verified manually against the devcontainer instead.
+- Anything spawning the server must set `env!("CARGO_BIN_EXE_poc-rust-mcp")`, `env_remove`
+  `DATABASE_URL` so an ambient value cannot change what is under test, and `kill_on_drop(true)`.
+- Read each JSON-RPC response **before** closing stdin; rmcp 0.1.5 drops in-flight responses at EOF.
+- Time budgets must be *tighter* than the behaviour they guard. The acquire timeout is 3s, so the
+  "arithmetic never blocks on the database" guard uses a 1s budget — a 5s budget silently passes
+  even when the fire-and-forget write has been turned back into a blocking one.
+- `ToolBox::list()` is backed by a `HashMap`, so tool order is **not deterministic** — sort before
+  asserting.
+- Recovering from a tripped breaker takes 30s by design, so it is verified manually, not in the
+  suite.
 
 ## Verification (run before finishing any change)
 

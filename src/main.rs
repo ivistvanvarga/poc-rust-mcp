@@ -1,15 +1,11 @@
-mod db;
-mod server;
-
 use std::{net::SocketAddr, process::ExitCode};
 
 use anyhow::{Context, bail};
-use db::Store;
+use poc_rust_mcp::{db::Store, server::Calculator};
 use rmcp::{
     ServiceExt,
     transport::{sse_server::SseServer, stdio},
 };
-use server::Calculator;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_SSE_ADDR: &str = "127.0.0.1:8000";

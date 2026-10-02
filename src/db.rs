@@ -357,55 +357,8 @@ impl Store {
 mod tests {
     use super::*;
 
-    /// Unreachable port with a timeout short enough to keep the suite fast.
-    const DEAD_URL: &str = "postgres://mcp:mcp@127.0.0.1:1/mcp";
-    const FAST: Duration = Duration::from_millis(200);
-
-    #[test]
-    fn disabled_store_reports_itself_as_unconfigured() {
-        assert!(!Store::disabled().is_configured());
-    }
-
-    #[tokio::test]
-    async fn disabled_store_fails_every_operation_with_the_same_message() {
-        let store = Store::disabled();
-        assert_eq!(store.status().await.unwrap_err(), Store::DISABLED);
-        assert_eq!(store.list(10).await.unwrap_err(), Store::DISABLED);
-        assert_eq!(store.clear().await.unwrap_err(), Store::DISABLED);
-    }
-
-    #[tokio::test]
-    async fn unparsable_url_degrades_to_disabled_storage() {
-        assert!(!Store::connect("not-a-postgres-url").is_configured());
-    }
-
-    #[tokio::test]
-    async fn unreachable_database_is_configured_but_fails_fast() {
-        let store = Store::connect_with_timeout(DEAD_URL, FAST);
-        assert!(store.is_configured());
-        // Bounded by the acquire timeout — this must not block for sqlx's default ~30s.
-        assert!(store.status().await.is_err());
-    }
-
-    #[tokio::test]
-    async fn breaker_opens_after_repeated_failures_and_fails_without_touching_the_pool() {
-        let store = Store::connect_with_timeout(DEAD_URL, FAST);
-        assert!(store.status().await.is_err());
-        assert!(store.status().await.is_err());
-
-        // Once tripped, further calls are rejected without attempting a connection, so they are
-        // effectively instant even though the acquire timeout is still armed.
-        let started = Instant::now();
-        let error = store.status().await.unwrap_err();
-        assert!(
-            started.elapsed() < FAST,
-            "breaker did not short-circuit: took {started:?}"
-        );
-        assert!(
-            error.contains("temporarily disabled"),
-            "unexpected error: {error}"
-        );
-    }
+    // Only behaviour that needs private access lives here; the public `Store` surface is covered
+    // by tests/store_offline.rs, and the tool-facing behaviour by tests/stdio_protocol.rs.
 
     #[test]
     fn successful_call_resets_the_breaker() {
@@ -423,46 +376,9 @@ mod tests {
 
     #[test]
     fn breaker_does_not_trip_on_query_level_errors() {
+        // A bad query must not be able to disable storage.
         let store = Store::disabled();
         store.note_failure(&sqlx::Error::RowNotFound);
         assert_eq!(store.breaker.lock().unwrap().failures, 0);
-    }
-
-    #[tokio::test]
-    async fn recording_is_fire_and_forget_and_never_blocks() {
-        for store in [
-            Store::disabled(),
-            Store::connect_with_timeout(DEAD_URL, FAST),
-        ] {
-            let started = Instant::now();
-            store.record_success("add", serde_json::json!({ "a": 1, "b": 2 }), "3");
-            store.record_failure("div", serde_json::json!({}), "division by zero");
-            assert!(
-                started.elapsed() < FAST,
-                "recording blocked the calculator for {started:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn history_entry_prefers_result_and_falls_back_to_error() {
-        let entry = |result, error| HistoryEntry {
-            id: 7,
-            operation: "add".to_owned(),
-            inputs: serde_json::json!({ "a": 1, "b": 1 }),
-            result,
-            error,
-            created_at: DateTime::<Utc>::UNIX_EPOCH,
-        };
-        assert!(
-            entry(Some("2".to_owned()), None)
-                .to_line()
-                .ends_with("-> 2")
-        );
-        assert!(
-            entry(None, Some("division by zero".to_owned()))
-                .to_line()
-                .ends_with("-> error: division by zero")
-        );
     }
 }

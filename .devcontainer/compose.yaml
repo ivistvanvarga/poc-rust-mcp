@@ -1,0 +1,51 @@
+# podman-compose stack for local development: a Rust devcontainer plus PostgreSQL.
+#
+#   podman-compose -f .devcontainer/compose.yaml up -d --build
+#   podman-compose -f .devcontainer/compose.yaml exec app cargo test
+#   podman-compose -f .devcontainer/compose.yaml down -v
+#
+# Note: `depends_on` here does NOT wait for PostgreSQL to accept connections. That is
+# deliberate — the MCP server connects lazily and degrades gracefully when the database is
+# not ready yet (src/db.rs), so the app container never has to block on startup.
+services:
+  db:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_USER: mcp
+      POSTGRES_PASSWORD: mcp
+      POSTGRES_DB: mcp
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      # Exposed on the host so `cargo run` from outside the container can reach it too.
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mcp -d mcp"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  app:
+    build:
+      # See Dockerfile for why this image exists instead of using the base image directly.
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /workspace
+    environment:
+      # `db` is the compose service name; must match the service above, not localhost.
+      DATABASE_URL: postgres://mcp:mcp@db:5432/mcp
+      RUST_LOG: info
+      CARGO_TERM_COLOR: always
+    volumes:
+      # The compose file lives in .devcontainer/, so `..` is the repository root.
+      # `:z` is required for SELinux hosts (Fedora/RHEL): without the relabel the container
+      # process is denied access to the mounted host directory.
+      - ..:/workspace:z
+    depends_on:
+      - db
+    command: ["sleep", "infinity"]
+
+volumes:
+  pgdata:

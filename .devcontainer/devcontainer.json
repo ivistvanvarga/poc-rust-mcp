@@ -1,0 +1,34 @@
+{
+  "name": "poc-rust-mcp",
+  "dockerComposeFile": "compose.yaml",
+  "service": "app",
+  "workspaceFolder": "/workspace",
+  "remoteUser": "root",
+  "shutdownAction": "stopCompose",
+  "waitFor": "postCreateCommand",
+  "postCreateCommand": "cargo fetch",
+  "containerEnv": {
+    "DATABASE_URL": "postgres://mcp:mcp@db:5432/mcp",
+    "RUST_LOG": "info"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml"
+      ],
+      "settings": {
+        "rust-analyzer.cargo.allTargets": true
+      }
+    }
+  },
+  "portsAttributes": {
+    "5432": {
+      "label": "PostgreSQL (host-accessible)"
+    },
+    "8000": {
+      "label": "MCP SSE server (cargo run -- --sse)"
+    }
+  },
+  "forwardPorts": [8000]
+}

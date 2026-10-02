@@ -1,0 +1,46 @@
+# Example configuration for poc-rust-mcp.
+#
+#   cargo run -- --config config.example.toml
+#   MCP_CONFIG=config.example.toml cargo run
+#
+# Every setting here is optional: an absent key keeps its built-in default, and a missing file is
+# simply no file layer at all. Overrides, highest first:
+#
+#   command-line flag > environment variable > this file > built-in default
+#
+# Unknown keys are rejected, so a typo fails at startup instead of silently doing nothing.
+# Durations are milliseconds (integers) because TOML has no duration type.
+
+[server]
+# Bind address for `--sse`. Overridden by --sse or MCP_SSE_ADDRESS.
+# Default: 127.0.0.1:8000
+# sse_address = "127.0.0.1:8000"
+
+# `tracing` filter directive. Overridden by RUST_LOG. Default: "info"
+# log_filter = "info"
+
+[storage]
+# PostgreSQL URL. Leave unset (or blank) to disable storage: the server still starts and every
+# arithmetic tool still works, while the three history tools report that storage is off.
+# Overridden by --db-url or DATABASE_URL.
+#
+# Note: the connection is made with TLS disabled, which suits a local database.
+# url = "postgres://mcp:mcp@127.0.0.1:5432/mcp"
+
+# Maximum pooled connections. Must be at least 1. Default: 5
+# max_connections = 5
+
+# How long a storage operation may wait for a connection before it counts as failed. This is what
+# keeps a downed database from stalling every tool call; must be greater than 0. Default: 3000
+# acquire_timeout_ms = 3000
+
+# Consecutive connectivity failures after which storage is skipped entirely. Must be at least 1.
+# Query-level errors never count, so a bad query cannot disable storage. Default: 2
+# breaker_threshold = 2
+
+# How long storage stays skipped once the breaker opens. Must be greater than 0. Default: 30000
+# breaker_cooldown_ms = 30000
+
+# Upper bound on rows `calc_history` returns; a client-supplied limit is clamped into 1..=this.
+# Must be at least 1. Default: 100
+# max_history_rows = 100

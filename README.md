@@ -14,7 +14,7 @@ a database exists, is reachable, or is misconfigured. Storage degrades; it never
 | `mul` | `a: i32`, `b: i32` | `"6 * 7 = 42"` |
 | `div` | `dividend: f64`, `divisor: f64` | `"9 / 2 = 4.5"`, or a tool error `division by zero` |
 | `db_status` | — | `"database reachable, 128 stored calculations"` |
-| `calc_history` | `limit: i64` (clamped to `1..=100`) | one line per entry, most recent first |
+| `calc_history` | `limit: i64` (clamped to `1..=storage.max_history_rows`) | one line per entry, most recent first |
 | `clear_calc_history` | — | `"deleted 128 recorded calculations"` |
 
 ## Requirements
@@ -50,10 +50,62 @@ cargo run
 
 ## Configuration
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `DATABASE_URL` | unset | PostgreSQL URL for calculation history. Unset, empty, or unparsable ⇒ storage disabled. TLS is disabled for the connection. |
-| `RUST_LOG` | `info` | `tracing` filter. Logs always go to **stderr**, because stdout carries the protocol. |
+Settings come from four layers. Each one overrides the one before it:
+
+```
+command-line flag  >  environment variable  >  config file  >  built-in default
+```
+
+**No config file is required.** A missing file is simply an absent layer, so a bare `cargo run`
+behaves exactly as before. Nothing is discovered implicitly: to use a file you name it with
+`--config` or `MCP_CONFIG`, so behaviour never depends on a file that happens to be lying around in
+the working directory.
+
+```bash
+cargo run -- --config config.example.toml   # explicit
+MCP_CONFIG=config.example.toml cargo run    # via environment
+```
+
+Copy `config.example.toml` to `config.toml` (git-ignored) and edit it. Every key is optional, unknown
+keys are rejected rather than ignored, and durations are integer milliseconds because TOML has no
+duration type.
+
+### Settings
+
+| Setting | Flag | Environment | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| — | `--config <PATH>` | `MCP_CONFIG` | none | TOML config file to load |
+| `server.sse_address` | `--sse [ADDR]` | `MCP_SSE_ADDRESS` | `127.0.0.1:8000` | Bind address for the SSE transport |
+| `server.log_filter` | — | `RUST_LOG` | `info` | `tracing` filter; logs always go to **stderr** |
+| `storage.url` | `--db-url <URL>` | `DATABASE_URL` | unset | PostgreSQL URL. Unset, blank, or unparsable ⇒ storage disabled |
+| `storage.max_connections` | — | `MCP_STORAGE_MAX_CONNECTIONS` | `5` | Pool size |
+| `storage.acquire_timeout_ms` | — | `MCP_STORAGE_ACQUIRE_TIMEOUT_MS` | `3000` | How long an operation may wait for a connection |
+| `storage.breaker_threshold` | — | `MCP_STORAGE_BREAKER_THRESHOLD` | `2` | Connectivity failures before storage is skipped |
+| `storage.breaker_cooldown_ms` | — | `MCP_STORAGE_BREAKER_COOLDOWN_MS` | `30000` | How long the breaker stays open |
+| `storage.max_history_rows` | — | `MCP_STORAGE_MAX_HISTORY_ROWS` | `100` | Upper bound on rows `calc_history` returns |
+
+A blank value counts as unset, so an empty `DATABASE_URL` exported by a compose file or CI job means
+"not configured" rather than "empty URL".
+
+Bad configuration is rejected at startup, before the transport opens, with the offending key named:
+
+```
+$ poc-rust-mcp --config bad.toml
+poc-rust-mcp: invalid config file bad.toml: TOML parse error at line 2, column 1
+  |
+2 | max_connection = 4
+  | ^^^^^^^^^^^^^^
+unknown field `max_connection`, expected one of `url`, `max_connections`, …
+```
+
+### Precedence example
+
+```bash
+# config.toml says max_connections = 11 and log_filter = "warn"
+export MCP_STORAGE_MAX_CONNECTIONS=9   # beats the file
+cargo run -- --sse 0.0.0.0:9000        # beats MCP_SSE_ADDRESS and the file
+# -> max_connections = 9, sse_address = 0.0.0.0:9000, log_filter = "warn"
+```
 
 ## Running
 
@@ -111,7 +163,8 @@ cargo build
 
 ## How storage behaves
 
-`DATABASE_URL` is the only knob, and it is entirely optional.
+Everything here is configurable (see [Configuration](#configuration)); with no configuration at all,
+these are the defaults.
 
 - **Missing or unparsable URL ⇒ storage disabled.** The server starts normally, every arithmetic tool
   works, and the three history tools return an explanatory error.
@@ -145,6 +198,7 @@ Tests are hermetic: `cargo test` passes on a bare checkout with **no PostgreSQL 
 | --- | --- | --- |
 | Protocol | `tests/stdio_protocol.rs` | Spawns the real binary and speaks raw JSON-RPC: capabilities, `tools/list`, argument validation, tool errors vs JSON-RPC errors, stdout purity, and that arithmetic does not block on a dead database. |
 | Public API | `tests/store_offline.rs` | The `Store`/`HistoryEntry` surface without a database: disabled storage, unparsable URLs, bounded failure, breaker tripping, fire-and-forget writes. |
+| Configuration | `tests/config.rs` | Layer precedence, defaults, blank-value handling, rejected keys and out-of-range values, CLI parsing, and that resolved settings reach the `Store`. |
 | Private | `src/**/mod tests` | Only what needs private access — `rmcp`'s macro makes tool functions private, and breaker internals are reachable only inside `db.rs`. |
 
 Anything that needs a live database (real inserts, `DELETE` row counts, migration
@@ -154,11 +208,13 @@ devcontainer rather than in `cargo test`.
 ### Layout
 
 ```
-src/lib.rs                     library target: exposes db + server
+src/lib.rs                     library target: exposes config + db + server
+src/config.rs                  layered configuration (defaults/file/env/flags)
 src/main.rs                    CLI, tracing, stdio/SSE wiring
 src/server.rs                  Calculator server, tool definitions, ServerInfo
 src/db.rs                      all PostgreSQL access, migrations, circuit breaker
 migrations/                    sqlx migrations
+config.example.toml            documented example config (copy to config.toml)
 tests/                         integration tests
 .devcontainer/                 podman-compose stack (app + postgres:16)
 AGENTS.md                      notes and gotchas for coding agents
@@ -167,9 +223,15 @@ AGENTS.md                      notes and gotchas for coding agents
 The crate ships both a lib and a bin, so the server can be embedded in another Rust program:
 
 ```rust
-use poc_rust_mcp::{db::Store, server::Calculator};
+use poc_rust_mcp::{
+    config::{Cli, Config, SystemEnv},
+    db::Store,
+    server::Calculator,
+};
 
-let calculator = Calculator::new(Store::from_env());
+let cli = Cli::parse_from(std::env::args().skip(1))?;
+let config = Config::resolve(&cli, &SystemEnv)?;
+let calculator = Calculator::new(Store::from_settings(&config.storage));
 ```
 
 ## Known limitations
@@ -180,3 +242,5 @@ let calculator = Calculator::new(Store::from_env());
 - `rmcp` is pinned to `0.1`, whose API differs substantially from 3.x — see `AGENTS.md`.
 - `ToolBox::list()` is backed by a `HashMap`, so tool order is not deterministic (`tool_names()`
   sorts).
+- There is no config-file discovery: a file is only read when `--config` or `MCP_CONFIG` names it.
+  Longest-prefix or per-directory search would be the next step if that becomes annoying.

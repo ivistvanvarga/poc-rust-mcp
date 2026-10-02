@@ -6,13 +6,13 @@ use rmcp::{
 
 use crate::db::Store;
 
-/// Upper bound on rows returned by the history tools, so a client cannot ask for everything.
-const MAX_HISTORY_ROWS: i64 = 100;
-
-/// Clamp a client-supplied history limit into `1..=MAX_HISTORY_ROWS`.
+/// Clamp a client-supplied history limit into `1..=max`.
+///
+/// `max` comes from configuration (`storage.max_history_rows`) so a client can never ask for an
+/// unbounded result set.
 #[must_use]
-pub fn clamp_history_limit(limit: i64) -> i64 {
-    limit.clamp(1, MAX_HISTORY_ROWS)
+pub fn clamp_history_limit(limit: i64, max: i64) -> i64 {
+    limit.clamp(1, max.max(1))
 }
 
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
@@ -25,7 +25,9 @@ pub struct DivisionRequest {
 
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 pub struct HistoryRequest {
-    #[schemars(description = "How many of the most recent calculations to return (1-100)")]
+    #[schemars(
+        description = "How many of the most recent calculations to return (clamped to 1..max_history_rows)"
+    )]
     pub limit: i64,
 }
 
@@ -119,7 +121,7 @@ impl Calculator {
 
     #[tool(description = "List previously recorded calculations, most recent first")]
     async fn calc_history(&self, #[tool(aggr)] request: HistoryRequest) -> Result<String, String> {
-        let limit = clamp_history_limit(request.limit);
+        let limit = clamp_history_limit(request.limit, self.store.max_history_rows());
         let entries = self.store.list(limit).await?;
         if entries.is_empty() {
             return Ok("no calculations recorded yet".to_owned());

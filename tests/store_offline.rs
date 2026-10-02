@@ -81,13 +81,19 @@ async fn repeated_connection_failures_open_the_circuit_breaker() {
     );
 }
 
-#[tokio::test]
-async fn history_limit_is_clamped_to_a_sane_range() {
-    assert_eq!(clamp_history_limit(i64::MIN), 1);
-    assert_eq!(clamp_history_limit(0), 1);
-    assert_eq!(clamp_history_limit(1), 1);
-    assert_eq!(clamp_history_limit(42), 42);
-    assert_eq!(clamp_history_limit(i64::MAX), 100);
+#[test]
+fn history_limit_is_clamped_to_the_configured_maximum() {
+    // The cap now comes from configuration, so clamping is exercised against a chosen maximum.
+    let max = 100;
+    assert_eq!(clamp_history_limit(i64::MIN, max), 1);
+    assert_eq!(clamp_history_limit(0, max), 1);
+    assert_eq!(clamp_history_limit(1, max), 1);
+    assert_eq!(clamp_history_limit(42, max), 42);
+    assert_eq!(clamp_history_limit(i64::MAX, max), max);
+
+    // A nonsensical cap must not panic or produce an inverted range.
+    assert_eq!(clamp_history_limit(50, 0), 1);
+    assert_eq!(clamp_history_limit(50, -5), 1);
 }
 
 #[tokio::test]

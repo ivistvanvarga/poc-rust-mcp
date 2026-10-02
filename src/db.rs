@@ -12,20 +12,7 @@ use sqlx::{
 use tokio::sync::OnceCell;
 use tracing::{debug, warn};
 
-/// Number of pooled connections kept open for the MCP server.
-const MAX_CONNECTIONS: u32 = 5;
-
-/// How long a storage operation may wait for a connection before it is reported as failed.
-///
-/// `connect_lazy` never fails, so without this bound every tool call would block on TCP connect
-/// for ~30s whenever PostgreSQL is down — exactly the situation graceful degradation exists for.
-const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Consecutive connection failures after which storage is skipped without trying to connect.
-const BREAKER_THRESHOLD: u32 = 2;
-
-/// How long storage stays skipped after tripping the circuit breaker.
-const BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
+use crate::config::StorageConfig;
 
 /// Whether a sqlx error means "the database is unreachable" as opposed to "the query was bad".
 /// Only the former should trip the breaker; a bad query must not disable storage.
@@ -71,20 +58,61 @@ impl HistoryEntry {
     }
 }
 
+/// Tunable storage limits, normally produced from [`StorageConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Maximum pooled connections.
+    pub max_connections: u32,
+    /// How long an operation may wait for a connection before it is reported as failed.
+    ///
+    /// The pool is created lazily and never fails to connect, so without this bound every tool
+    /// call would block on TCP connect for ~30s whenever PostgreSQL is down — exactly the
+    /// situation graceful degradation exists for.
+    pub acquire_timeout: Duration,
+    /// Consecutive connection failures after which storage is skipped without trying to connect.
+    pub breaker_threshold: u32,
+    /// How long storage stays skipped after tripping the circuit breaker.
+    pub breaker_cooldown: Duration,
+    /// Upper bound on rows returned by `calc_history`.
+    pub max_history_rows: i64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        // Mirrors `StorageConfig::default()`, so a `Store` built without configuration behaves
+        // exactly like one built from an empty config file.
+        Self::from(&StorageConfig::default())
+    }
+}
+
+impl From<&StorageConfig> for Limits {
+    fn from(storage: &StorageConfig) -> Self {
+        Self {
+            max_connections: storage.max_connections,
+            acquire_timeout: storage.acquire_timeout,
+            breaker_threshold: storage.breaker_threshold,
+            breaker_cooldown: storage.breaker_cooldown,
+            max_history_rows: storage.max_history_rows,
+        }
+    }
+}
+
 /// Optional Postgres-backed storage for calculator history.
 ///
-/// A `Store` is always constructible: when `DATABASE_URL` is missing or unusable the pool is
-/// `None` and every storage operation returns an error instead of panicking, so the MCP server
-/// still starts and serves the pure-computation tools.
+/// A `Store` is always constructible: when no usable URL is configured the pool is `None` and every
+/// storage operation returns an error instead of panicking, so the MCP server still starts and
+/// serves the pure-computation tools.
 ///
 /// When the database is configured but unreachable, a circuit breaker keeps the arithmetic tools
-/// fast: after [`BREAKER_THRESHOLD`] connection failures, storage is skipped for
-/// [`BREAKER_COOLDOWN`] instead of making every tool call wait out [`ACQUIRE_TIMEOUT`].
+/// fast: after [`Limits::breaker_threshold`] connection failures, storage is skipped for
+/// [`Limits::breaker_cooldown`] instead of making every tool call wait out
+/// [`Limits::acquire_timeout`].
 #[derive(Debug, Clone, Default)]
 pub struct Store {
     pool: Option<PgPool>,
     schema: OnceCell<()>,
     breaker: Arc<Mutex<Breaker>>,
+    limits: Limits,
 }
 
 /// Connection-failure bookkeeping backing the graceful-degradation behaviour.
@@ -98,25 +126,22 @@ impl Store {
     /// Storage that is permanently off; every storage call fails fast with [`Self::DISABLED`].
     #[must_use]
     pub fn disabled() -> Self {
-        Self {
-            pool: None,
-            schema: OnceCell::const_new(),
-            breaker: Arc::default(),
-        }
+        Self::with_limits(None, Limits::default())
     }
 
     /// Message returned when storage is not configured.
-    pub const DISABLED: &'static str =
-        "storage unavailable: DATABASE_URL is not set to a usable PostgreSQL URL";
+    pub const DISABLED: &'static str = "storage unavailable: no usable PostgreSQL URL is \
+        configured (set DATABASE_URL, --db-url, or [storage].url in a config file)";
 
-    /// Build a store from `DATABASE_URL`, degrading to disabled storage when it is absent.
+    /// Build a store from resolved [`StorageConfig`].
+    ///
+    /// This is the normal entry point: the binary resolves configuration once at startup and hands
+    /// the storage section over. A missing or unparsable URL degrades to disabled storage with a
+    /// warning rather than failing.
     #[must_use]
-    pub fn from_env() -> Self {
-        let url = std::env::var("DATABASE_URL")
-            .ok()
-            .filter(|u| !u.trim().is_empty());
-        match url {
-            Some(url) => Self::connect(&url),
+    pub fn from_settings(storage: &StorageConfig) -> Self {
+        match &storage.url {
+            Some(url) => Self::connect_with_limits(url, Limits::from(storage)),
             None => {
                 warn!(
                     "{}; serving calculator tools without history",
@@ -127,45 +152,74 @@ impl Store {
         }
     }
 
-    /// Build a lazily-connected store for `url`. The pool is **not** contacted here, so this
-    /// never fails on an unreachable database.
+    /// Build a lazily-connected store for `url` using default limits. The pool is **not** contacted
+    /// here, so this never fails on an unreachable database.
     #[must_use]
     pub fn connect(url: &str) -> Self {
-        Self::connect_with_timeout(url, ACQUIRE_TIMEOUT)
+        Self::connect_with_limits(url, Limits::default())
     }
 
     /// As [`Self::connect`], with an explicit bound on how long operations wait for a connection.
     /// Tests use a millisecond-scale timeout to stay fast.
     #[must_use]
     pub fn connect_with_timeout(url: &str, acquire_timeout: Duration) -> Self {
-        match Self::try_connect(url, acquire_timeout) {
+        Self::connect_with_limits(
+            url,
+            Limits {
+                acquire_timeout,
+                ..Limits::default()
+            },
+        )
+    }
+
+    /// As [`Self::connect`], with every limit supplied explicitly.
+    #[must_use]
+    pub fn connect_with_limits(url: &str, limits: Limits) -> Self {
+        match Self::try_connect(url, limits) {
             Ok(store) => store,
             Err(error) => {
-                warn!(%error, "invalid DATABASE_URL; serving calculator tools without history");
-                Self::disabled()
+                warn!(%error, "unusable PostgreSQL URL; serving calculator tools without history");
+                Self::with_limits(None, limits)
             }
         }
     }
 
-    fn try_connect(url: &str, acquire_timeout: Duration) -> Result<Self, sqlx::Error> {
+    fn try_connect(url: &str, limits: Limits) -> Result<Self, sqlx::Error> {
         // The devcontainer database speaks plaintext TCP; being explicit avoids depending on the
         // TLS feature set of sqlx and avoids a pointless SSL negotiation attempt.
         let options = PgConnectOptions::from_str(url)?.ssl_mode(PgSslMode::Disable);
         let pool = PgPoolOptions::new()
-            .max_connections(MAX_CONNECTIONS)
-            .acquire_timeout(acquire_timeout)
+            .max_connections(limits.max_connections)
+            .acquire_timeout(limits.acquire_timeout)
             .connect_lazy_with(options);
-        Ok(Self {
-            pool: Some(pool),
-            schema: OnceCell::new(),
+        Ok(Self::with_limits(Some(pool), limits))
+    }
+
+    fn with_limits(pool: Option<PgPool>, limits: Limits) -> Self {
+        Self {
+            pool,
+            schema: OnceCell::const_new(),
             breaker: Arc::default(),
-        })
+            limits,
+        }
     }
 
     /// True when a database is configured, whether or not it is reachable right now.
     #[must_use]
     pub const fn is_configured(&self) -> bool {
         self.pool.is_some()
+    }
+
+    /// The limits this store was built with.
+    #[must_use]
+    pub const fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    /// Upper bound on rows `calc_history` will return, from configuration.
+    #[must_use]
+    pub const fn max_history_rows(&self) -> i64 {
+        self.limits.max_history_rows
     }
 
     /// Reject the call immediately while the breaker is open, so a downed database costs no
@@ -203,11 +257,12 @@ impl Store {
             return;
         };
         breaker.failures += 1;
-        if breaker.failures >= BREAKER_THRESHOLD {
-            breaker.retry_after = Some(Instant::now() + BREAKER_COOLDOWN);
+        if breaker.failures >= self.limits.breaker_threshold {
+            breaker.retry_after = Some(Instant::now() + self.limits.breaker_cooldown);
             warn!(
                 failures = breaker.failures,
-                "storage circuit breaker open; skipping database for {BREAKER_COOLDOWN:?}"
+                cooldown = ?self.limits.breaker_cooldown,
+                "storage circuit breaker open; skipping database temporarily"
             );
         }
     }

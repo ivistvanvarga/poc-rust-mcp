@@ -24,3 +24,4 @@ sqlx = { version = "0.8", default-features = false, features = [
     "chrono",
 ] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+toml = "1.1.6"

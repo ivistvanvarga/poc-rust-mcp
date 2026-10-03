@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use poc_rust_mcp::{
     config::{Cli, Config, SystemEnv},
-    db::Store,
+    db::{Dialect, Store},
     server::Calculator,
 };
 use rmcp::{
@@ -60,11 +60,7 @@ fn init_tracing(log_filter: &str) {
 }
 
 async fn serve_stdio(store: Store) -> Result<()> {
-    let storage = if store.is_configured() {
-        "postgres"
-    } else {
-        "disabled"
-    };
+    let storage = store.dialect().map_or("disabled", Dialect::label);
     let service = Calculator::new(store)
         .serve(stdio())
         .await
@@ -78,11 +74,7 @@ async fn serve_stdio(store: Store) -> Result<()> {
 }
 
 async fn serve_sse(addr: std::net::SocketAddr, store: Store) -> Result<()> {
-    let storage = if store.is_configured() {
-        "postgres"
-    } else {
-        "disabled"
-    };
+    let storage = store.dialect().map_or("disabled", Dialect::label);
     let cancel = SseServer::serve(addr)
         .await
         .with_context(|| format!("failed to bind SSE server to {addr}"))?

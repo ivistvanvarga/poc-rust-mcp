@@ -1,8 +1,11 @@
 # poc-rust-mcp
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server that does arithmetic, built with
-[`rmcp`](https://crates.io/crates/rmcp) and Tokio, with an **optional** PostgreSQL-backed history of
+[`rmcp`](https://crates.io/crates/rmcp) and Tokio, with an **optional** database-backed history of
 every calculation.
+
+History storage works on **PostgreSQL, MySQL/MariaDB and SQLite**. The URL's scheme picks the
+backend; nothing else is configured.
 
 The point of the PoC is the storage story: the calculator tools must answer instantly whether or not
 a database exists, is reachable, or is misconfigured. Storage degrades; it never blocks.
@@ -13,7 +16,7 @@ a database exists, is reachable, or is misconfigured. Storage degrades; it never
 | `sub` | `a: i32`, `b: i32` | `"7 - 2 = 5"` |
 | `mul` | `a: i32`, `b: i32` | `"6 * 7 = 42"` |
 | `div` | `dividend: f64`, `divisor: f64` | `"9 / 2 = 4.5"`, or a tool error `division by zero` |
-| `db_status` | — | `"database reachable, 128 stored calculations"` |
+| `db_status` | — | `"mysql database reachable, 128 stored calculations"` |
 | `calc_history` | `limit: i64` (clamped to `1..=storage.max_history_rows`) | one line per entry, most recent first |
 | `clear_calc_history` | — | `"deleted 128 recorded calculations"` |
 
@@ -21,8 +24,9 @@ a database exists, is reachable, or is misconfigured. Storage degrades; it never
 
 - Rust `stable` ≥ 1.85 (edition 2024). A `rust-toolchain.toml` pins stable with `clippy` and
   `rustfmt`, so nothing needs installing manually.
-- PostgreSQL is **optional**. Everything except the three history tools works without it.
+- A database is **optional**. Everything except the three history tools works without one.
 - `podman` + `podman-compose` only if you want the devcontainer.
+- SQLite needs no server at all; PostgreSQL and MySQL are only needed to test against those backends.
 
 ## Quick start
 
@@ -33,20 +37,52 @@ cargo run                     # stdio (default)
 cargo run -- --help
 ```
 
-With the devcontainer (app + PostgreSQL, `DATABASE_URL` wired to the `db` service):
+With a database, pick the URL scheme:
+
+```bash
+cargo run -- --db-url sqlite://mcp.db          # SQLite file, created if missing
+cargo run -- --db-url sqlite::memory:          # SQLite, nothing on disk
+cargo run -- --db-url postgres://mcp:mcp@127.0.0.1:5432/mcp
+cargo run -- --db-url mysql://mcp:mcp@127.0.0.1:3306/mcp
+```
+
+With the devcontainer (app + PostgreSQL + MySQL, `DATABASE_URL` wired to the `db` service):
 
 ```bash
 podman-compose -f .devcontainer/compose.yaml up -d --build
 podman-compose -f .devcontainer/compose.yaml exec app cargo run
 ```
 
-PostgreSQL is published on host port `5432` as `mcp` / `mcp` / `mcp`, so `cargo run` from your host
-works too:
+PostgreSQL is published on host port `5432` and MySQL on `3306`, both as `mcp` / `mcp` / `mcp`, so
+`cargo run` from your host works too:
 
 ```bash
-export DATABASE_URL=postgres://mcp:mcp@127.0.0.1:5432/mcp
+export DATABASE_URL=postgres://mcp:mcp@127.0.0.1:5432/mcp   # or mysql://…:3306/mcp
 cargo run
 ```
+
+## Backends
+
+| URL scheme | Backend | Reported by `db_status` as |
+| --- | --- | --- |
+| `postgres://`, `postgresql://` | PostgreSQL | `postgres` |
+| `mysql://`, `mariadb://` | MySQL or MariaDB (sqlx's MySQL driver speaks to both) | `mysql` |
+| `sqlite://` | SQLite file or in-process | `sqlite` |
+
+`db_status` names the *driver*, not the scheme you typed, so `mariadb://` reports `mysql`.
+
+Notes per backend:
+
+- **MySQL/MariaDB** needs 8.0.16+ / 10.2.1+, the first releases that enforce `CHECK` constraints,
+  which the schema relies on to keep `result` and `error` mutually exclusive.
+- **SQLite** creates the file if it is missing. A URL pinned to `?mode=ro` or `?mode=rw` means "this
+  file must already exist" and is left alone. An in-memory database (`sqlite::memory:`) is capped at a
+  single pooled connection, because SQLite's shared-cache mode takes *table* locks that its busy
+  handler cannot wait out.
+- **TLS** follows the URL and the driver's own default. This crate builds sqlx without a TLS feature,
+  and every driver treats "no TLS compiled in" as "stay on plaintext" — so a local container works
+  untouched, and enabling a TLS feature later upgrades automatically. For a managed database that
+  *requires* TLS, put `?sslmode=require` (PostgreSQL) or `?ssl-mode=REQUIRED` (MySQL) in the URL.
 
 ## Configuration
 
@@ -77,7 +113,7 @@ duration type.
 | — | `--config <PATH>` | `MCP_CONFIG` | none | TOML config file to load |
 | `server.sse_address` | `--sse [ADDR]` | `MCP_SSE_ADDRESS` | `127.0.0.1:8000` | Bind address for the SSE transport |
 | `server.log_filter` | — | `RUST_LOG` | `info` | `tracing` filter; logs always go to **stderr** |
-| `storage.url` | `--db-url <URL>` | `DATABASE_URL` | unset | PostgreSQL URL. Unset, blank, or unparsable ⇒ storage disabled |
+| `storage.url` | `--db-url <URL>` | `DATABASE_URL` | unset | Database URL; the scheme picks the backend. Unset, blank, unparsable or unsupported ⇒ storage disabled |
 | `storage.max_connections` | — | `MCP_STORAGE_MAX_CONNECTIONS` | `5` | Pool size |
 | `storage.acquire_timeout_ms` | — | `MCP_STORAGE_ACQUIRE_TIMEOUT_MS` | `3000` | How long an operation may wait for a connection |
 | `storage.breaker_threshold` | — | `MCP_STORAGE_BREAKER_THRESHOLD` | `2` | Connectivity failures before storage is skipped |
@@ -97,6 +133,10 @@ poc-rust-mcp: invalid config file bad.toml: TOML parse error at line 2, column 1
   | ^^^^^^^^^^^^^^
 unknown field `max_connection`, expected one of `url`, `max_connections`, …
 ```
+
+An unparsable or unsupported *URL* is treated differently from a bad config file: it degrades to
+disabled storage with a warning naming the accepted schemes, rather than refusing to start. A server
+that cannot use its history is still a working calculator.
 
 ### Precedence example
 
@@ -161,15 +201,23 @@ cargo build
   | RUST_LOG=warn ./target/debug/poc-rust-mcp
 ```
 
+`scripts/verify-backend.sh <url>` does the same against a live database and additionally exercises
+`db_status`, `calc_history` and `clear_calc_history` — the manual check for a backend that needs a
+container:
+
+```bash
+./scripts/verify-backend.sh 'mysql://mcp:mcp@127.0.0.1:3306/mcp'
+```
+
 ## How storage behaves
 
 Everything here is configurable (see [Configuration](#configuration)); with no configuration at all,
 these are the defaults.
 
-- **Missing or unparsable URL ⇒ storage disabled.** The server starts normally, every arithmetic tool
-  works, and the three history tools return an explanatory error.
+- **Missing, unparsable or unsupported URL ⇒ storage disabled.** The server starts normally, every
+  arithmetic tool works, and the three history tools return an explanatory error.
 - **Migrations are applied lazily**, on the first storage call, not at startup, and retried until
-  they succeed. Add a new numbered file in `migrations/`; never edit an applied one.
+  they succeed. Migrations are **per backend** — see below.
 - **History writes are fire-and-forget** (`tokio::spawn`), so a tool never waits for the database.
   The trade-off: a row can be lost if the process exits immediately after the tool returns.
 - **Every storage attempt is bounded** by a 3 s acquire timeout, and a circuit breaker skips storage
@@ -177,11 +225,36 @@ these are the defaults.
   query cannot disable storage.
 - **Queries are not checked at compile time** (`query_as` + `#[derive(FromRow)]`), so building
   without a database works. The trade-off: a typo in SQL is a runtime error, not a build error.
-- `clear_calc_history` uses `DELETE`, not `TRUNCATE`, because `TRUNCATE` reports no row count and
-  the tool would claim it deleted nothing.
+- `clear_calc_history` uses `DELETE`, not `TRUNCATE`, because `TRUNCATE` reports no row count on
+  PostgreSQL or MySQL and the tool would claim it deleted nothing.
 
-Migration `0001_calc_history.sql` stores `operation`, the raw JSON `inputs`, and exactly one of
-`result` or `error` (enforced by a check constraint), indexed newest-first.
+### Migrations are per backend
+
+`migrations/` holds one directory per dialect, and `db.rs` embeds each set at compile time and picks
+the set to apply from the URL's scheme:
+
+```
+migrations/postgres/0001_calc_history.sql
+migrations/mysql/0001_calc_history.sql
+migrations/sqlite/0001_calc_history.sql
+```
+
+There is no spelling of "auto-incrementing key, JSON column, descending index" that all three
+backends accept, so one shared file is not an option. Adding migration `0002_*` means adding it to
+all three directories, and never editing an applied one — sqlx records each file's SHA-384 and a
+change to an applied file fails with `VersionMismatch`.
+
+Each `0001_calc_history.sql` stores `operation`, the raw JSON `inputs`, exactly one of `result` or
+`error` (enforced by a check constraint), and a `created_at` indexed newest-first.
+
+Two deliberate differences from PostgreSQL's defaults, both documented in the migration files:
+
+- **`created_at` is written by the server**, not left to the column default, so all three backends
+  store the same instant from one clock. SQLite's `CURRENT_TIMESTAMP` is a `YYYY-MM-DD HH:MM:SS`
+  string that does not sort against the RFC 3339 text `DateTime<Utc>` writes, and MySQL's `TIMESTAMP`
+  silently shifts by the session time zone (`DATETIME(6)` has no such conversion).
+- **SQLite's `created_at` has no `DEFAULT`** for the same reason: mixing two timestamp formats would
+  silently corrupt `ORDER BY created_at DESC`.
 
 ## Development
 
@@ -192,18 +265,19 @@ cargo test
 cargo build
 ```
 
-Tests are hermetic: `cargo test` passes on a bare checkout with **no PostgreSQL running**.
+Tests are hermetic: `cargo test` passes on a bare checkout with **no database running**.
 
 | Layer | File | What it proves |
 | --- | --- | --- |
 | Protocol | `tests/stdio_protocol.rs` | Spawns the real binary and speaks raw JSON-RPC: capabilities, `tools/list`, argument validation, tool errors vs JSON-RPC errors, stdout purity, and that arithmetic does not block on a dead database. |
-| Public API | `tests/store_offline.rs` | The `Store`/`HistoryEntry` surface without a database: disabled storage, unparsable URLs, bounded failure, breaker tripping, fire-and-forget writes. |
-| Configuration | `tests/config.rs` | Layer precedence, defaults, blank-value handling, rejected keys and out-of-range values, CLI parsing, and that resolved settings reach the `Store`. |
-| Private | `src/**/mod tests` | Only what needs private access — `rmcp`'s macro makes tool functions private, and breaker internals are reachable only inside `db.rs`. |
+| Public API | `tests/store_offline.rs` | The `Store`/`HistoryEntry` surface without a database: scheme→backend selection, disabled storage, unparsable and unsupported URLs, bounded failure, breaker tripping, fire-and-forget writes. |
+| Real backend | `tests/sqlite_backend.rs` | A full round trip against SQLite, which is embedded and needs no server: migrations apply, a JSON and a timestamp column survive a write/read, history is newest-first and limited, `clear` reports a real row count, a file-backed database persists across stores. |
+| Configuration | `tests/config.rs` | Layer precedence, defaults, blank-value handling, rejected keys and out-of-range values, CLI parsing, and that resolved settings and the resolved URL's backend reach the `Store`. |
+| Private | `src/**/mod tests` | Only what needs private access — `rmcp`'s macro makes tool functions private, and the schema cell, the dialect's SQL spelling and the SQLite URL parsing are private. |
 
-Anything that needs a live database (real inserts, `DELETE` row counts, migration
-`VersionMismatch`, recovering after the 30 s breaker cooldown) is verified manually against the
-devcontainer rather than in `cargo test`.
+Anything that needs a live PostgreSQL or MySQL is verified manually against the devcontainer with
+`scripts/verify-backend.sh`, rather than in `cargo test`. That includes migration `VersionMismatch`
+and recovering after the 30 s breaker cooldown.
 
 ### Layout
 
@@ -212,11 +286,12 @@ src/lib.rs                     library target: exposes config + db + server
 src/config.rs                  layered configuration (defaults/file/env/flags)
 src/main.rs                    CLI, tracing, stdio/SSE wiring
 src/server.rs                  Calculator server, tool definitions, ServerInfo
-src/db.rs                      all PostgreSQL access, migrations, circuit breaker
-migrations/                    sqlx migrations
+src/db.rs                      all database access, dialects, migrations, circuit breaker
+migrations/{postgres,mysql,sqlite}/  per-dialect sqlx migrations
 config.example.toml            documented example config (copy to config.toml)
+scripts/verify-backend.sh      manual end-to-end check against a live database
 tests/                         integration tests
-.devcontainer/                 podman-compose stack (app + postgres:16)
+.devcontainer/                 podman-compose stack (app + postgres + mysql)
 AGENTS.md                      notes and gotchas for coding agents
 ```
 
@@ -243,4 +318,8 @@ let calculator = Calculator::new(Store::from_settings(&config.storage));
 - `ToolBox::list()` is backed by a `HashMap`, so tool order is not deterministic (`tool_names()`
   sorts).
 - There is no config-file discovery: a file is only read when `--config` or `MCP_CONFIG` names it.
-  Longest-prefix or per-directory search would be the next step if that becomes annoying.
+  Longest-prefix or per-directory search would be the next step if this becomes annoying.
+- SQL Server is not supported. sqlx itself only implements PostgreSQL, MySQL and SQLite; MSSQL needs
+  the third-party `sqlx-mssql` crate.
+- SQLite file databases stay in the rollback-journal mode SQLite defaults to. A history log written by
+  several processes at once would want WAL, which the URL cannot currently request.

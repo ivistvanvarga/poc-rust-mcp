@@ -6,13 +6,29 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use sqlx::{
-    PgPool,
-    postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
+    MySqlPool, PgPool, SqlitePool,
+    migrate::Migrator,
+    mysql::{MySqlConnectOptions, MySqlPoolOptions},
+    postgres::{PgConnectOptions, PgPoolOptions},
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use tokio::sync::OnceCell;
 use tracing::{debug, warn};
 
 use crate::config::StorageConfig;
+
+/// Migrations are per-dialect: there is no spelling of "auto-incrementing key, JSON column,
+/// descending index" that all three backends accept.
+///
+/// One embedded set per backend rather than one shared file, chosen by the URL's scheme at runtime.
+/// `migrate!` still reads the SQL at *compile* time, so there is no filesystem access at runtime and
+/// no `DATABASE_URL`-dependent build step.
+///
+/// Every dialect's `0001_calc_history.sql` describes the same table. Adding migration `0002_*` means
+/// adding it to all three directories, and never editing an applied one (`VersionMismatch`).
+static POSTGRES_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/postgres");
+static MYSQL_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/mysql");
+static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/sqlite");
 
 /// Whether a sqlx error means "the database is unreachable" as opposed to "the query was bad".
 /// Only the former should trip the breaker; a bad query must not disable storage.
@@ -59,6 +75,10 @@ impl HistoryEntry {
 }
 
 /// Tunable storage limits, normally produced from [`StorageConfig`].
+///
+/// All of these are backend-independent: each [`Dialect`] builds its own pool from the same
+/// [`Limits`], so `acquire_timeout` bounds a MySQL handshake and an SQLite busy wait exactly as it
+/// bounds a PostgreSQL connect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// Maximum pooled connections.
@@ -66,7 +86,7 @@ pub struct Limits {
     /// How long an operation may wait for a connection before it is reported as failed.
     ///
     /// The pool is created lazily and never fails to connect, so without this bound every tool
-    /// call would block on TCP connect for ~30s whenever PostgreSQL is down — exactly the
+    /// call would block on TCP connect for ~30s whenever the database is down — exactly the
     /// situation graceful degradation exists for.
     pub acquire_timeout: Duration,
     /// Consecutive connection failures after which storage is skipped without trying to connect.
@@ -97,22 +117,288 @@ impl From<&StorageConfig> for Limits {
     }
 }
 
-/// Optional Postgres-backed storage for calculator history.
+/// Which database [`Store`] talks to, decided by the URL's scheme.
 ///
-/// A `Store` is always constructible: when no usable URL is configured the pool is `None` and every
-/// storage operation returns an error instead of panicking, so the MCP server still starts and
+/// These are the three drivers `sqlx` 0.8 implements itself. Each one carries its own SQL dialect
+/// and its own migration set; everything else about a backend — pooling, breaker bookkeeping, the
+/// tool-facing API — is shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    /// `postgres://` or `postgresql://`.
+    Postgres,
+    /// `mysql://` or `mariadb://` (sqlx's MySQL driver speaks to both).
+    MySql,
+    /// `sqlite://`, including `sqlite::memory:`.
+    Sqlite,
+}
+
+impl Dialect {
+    /// Every scheme [`Self::from_url`] accepts, for error messages and documentation.
+    pub const SCHEMES: [&'static str; 5] = ["postgres", "postgresql", "mysql", "mariadb", "sqlite"];
+
+    /// Name of the sqlx driver behind this dialect, reported by `db_status`.
+    ///
+    /// A `postgresql://` or `mariadb://` URL reports as `postgres`/`mysql`: that is the driver that
+    /// actually handles the connection, which is the useful thing to see in a log line.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::MySql => "mysql",
+            Self::Sqlite => "sqlite",
+        }
+    }
+
+    /// Recognise a backend from its URL scheme.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the accepted schemes if the URL has no scheme or one this build has
+    /// no driver for. Reporting it beats guessing: a typo'd scheme must not look like "storage is
+    /// merely unconfigured".
+    pub fn from_url(url: &str) -> Result<Self, String> {
+        let Some((scheme, _)) = url.split_once(':') else {
+            return Err(format!(
+                "expected a database URL starting with one of {}: (for example \
+                 postgres://mcp:mcp@127.0.0.1:5432/mcp), found {url:?}",
+                Self::SCHEMES.join(", ")
+            ));
+        };
+        match scheme.trim().to_ascii_lowercase().as_str() {
+            "postgres" | "postgresql" => Ok(Self::Postgres),
+            "mysql" | "mariadb" => Ok(Self::MySql),
+            "sqlite" => Ok(Self::Sqlite),
+            _ => Err(format!(
+                "unsupported database URL scheme {scheme:?}; expected one of {}",
+                Self::SCHEMES.join(", ")
+            )),
+        }
+    }
+
+    /// The migrations to apply against this backend.
+    const fn migrations(self) -> &'static Migrator {
+        match self {
+            Self::Postgres => &POSTGRES_MIGRATIONS,
+            Self::MySql => &MYSQL_MIGRATIONS,
+            Self::Sqlite => &SQLITE_MIGRATIONS,
+        }
+    }
+
+    /// The bind marker for the `index`-th (1-based) argument.
+    ///
+    /// This is the *only* SQL syntax that differs between these three backends: PostgreSQL numbers
+    /// its placeholders, MySQL and SQLite both use bare `?`. Writing the queries in one dialect's
+    /// spelling and rewriting the markers here is what keeps a single copy of the SQL text.
+    const fn placeholder(self, index: usize) -> &'static str {
+        match self {
+            Self::Postgres => match index {
+                1 => "$1",
+                2 => "$2",
+                3 => "$3",
+                4 => "$4",
+                5 => "$5",
+                // Every call site passes a literal index, so this cannot be reached; panicking in a
+                // `const fn` keeps a future sixth argument from compiling into a broken query.
+                _ => panic!("PostgreSQL placeholders are limited to $1..=$5"),
+            },
+            Self::MySql | Self::Sqlite => "?",
+        }
+    }
+
+    /// Append one call.
+    ///
+    /// `created_at` is written by the server instead of being left to the column default so that all
+    /// three backends store the same instant, in one format, from one clock. That matters where the
+    /// defaults disagree: SQLite's `CURRENT_TIMESTAMP` is a `YYYY-MM-DD HH:MM:SS` string that does
+    /// not sort against the RFC 3339 text `DateTime<Utc>` writes, and MySQL's `TIMESTAMP` silently
+    /// shifts by the session time zone. See the migration files.
+    fn insert_sql(self) -> String {
+        format!(
+            "INSERT INTO calc_history (operation, inputs, result, error, created_at) \
+             VALUES ({}, {}, {}, {}, {})",
+            self.placeholder(1),
+            self.placeholder(2),
+            self.placeholder(3),
+            self.placeholder(4),
+            self.placeholder(5),
+        )
+    }
+
+    /// Most recent entries first. `id` breaks ties, which are real: the SQLite and MySQL defaults
+    /// only have second resolution.
+    fn list_sql(self) -> String {
+        format!(
+            "SELECT id, operation, inputs, result, error, created_at \
+             FROM calc_history \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT {}",
+            self.placeholder(1),
+        )
+    }
+
+    fn delete_sql(self) -> &'static str {
+        "DELETE FROM calc_history"
+    }
+
+    fn count_sql(self) -> &'static str {
+        "SELECT count(*) FROM calc_history"
+    }
+}
+
+/// The pool for whichever backend the URL selected.
+///
+/// An enum rather than `sqlx::Any`, which would be the obvious runtime-generic choice. `Any` erases
+/// rows to a fixed set of scalar kinds (null, bool, smallint, integer, bigint, real, double, text,
+/// blob) and rejects anything else, so neither a `JSON`/`JSONB` column nor *any* timestamp type can
+/// be read back through it — `HistoryEntry` would be unconstructible. Keeping the concrete pools
+/// costs one `match` in four methods and buys real JSON and timestamp columns on every backend.
+#[derive(Debug, Clone)]
+enum Pool {
+    Postgres(PgPool),
+    MySql(MySqlPool),
+    Sqlite(SqlitePool),
+}
+
+impl Pool {
+    const fn dialect(&self) -> Dialect {
+        match self {
+            Self::Postgres(_) => Dialect::Postgres,
+            Self::MySql(_) => Dialect::MySql,
+            Self::Sqlite(_) => Dialect::Sqlite,
+        }
+    }
+
+    /// Build a pool for `url` **without dialling it**, so an unreachable or wrong database cannot
+    /// fail here — that is the whole point of lazy, degrading storage.
+    ///
+    /// TLS is left entirely up to the URL and the driver's own default. sqlx is built without a TLS
+    /// feature in this crate, and every driver treats "no TLS compiled in" as "stay on plaintext",
+    /// so a local container keeps working while enabling a TLS feature later upgrades automatically.
+    /// A managed database that *requires* TLS is reached by putting `?sslmode=require` (PostgreSQL)
+    /// or `?ssl-mode=REQUIRED` (MySQL) in the URL.
+    fn connect(url: &str, dialect: Dialect, limits: Limits) -> Result<Self, String> {
+        match dialect {
+            Dialect::Postgres => {
+                let options = PgConnectOptions::from_str(url).map_err(|error| error.to_string())?;
+                Ok(Self::Postgres(
+                    PgPoolOptions::new()
+                        .max_connections(limits.max_connections)
+                        .acquire_timeout(limits.acquire_timeout)
+                        .connect_lazy_with(options),
+                ))
+            }
+            Dialect::MySql => {
+                let options =
+                    MySqlConnectOptions::from_str(url).map_err(|error| error.to_string())?;
+                Ok(Self::MySql(
+                    MySqlPoolOptions::new()
+                        .max_connections(limits.max_connections)
+                        .acquire_timeout(limits.acquire_timeout)
+                        .connect_lazy_with(options),
+                ))
+            }
+            Dialect::Sqlite => {
+                let (database, params) = sqlite_url_parts(url);
+                let mut options =
+                    SqliteConnectOptions::from_str(url).map_err(|error| error.to_string())?;
+                // Create the file if it is missing, so `sqlite://mcp.db` works on a fresh checkout.
+                // A URL pinned to `mode=ro`/`mode=rw` means "this file must already exist".
+                if !matches!(sqlite_param(params, "mode"), Some("ro" | "rw")) {
+                    options = options.create_if_missing(true);
+                }
+                // sqlx's own busy timeout is 5s, which would outlast the `acquire_timeout` this
+                // store promises callers, so tie the two together.
+                options = options.pragma(
+                    "busy_timeout",
+                    limits.acquire_timeout.as_millis().to_string(),
+                );
+                // An in-memory database is private to this process, and SQLite's shared-cache mode
+                // takes *table*-level locks that the busy handler cannot wait out. One connection
+                // serialises it, which turns a contended write into a slow one rather than a failed
+                // one; a file-backed database keeps the configured pool size.
+                let max_connections = if sqlite_is_in_memory(database, params) {
+                    1
+                } else {
+                    limits.max_connections
+                };
+                Ok(Self::Sqlite(
+                    SqlitePoolOptions::new()
+                        .max_connections(max_connections)
+                        .acquire_timeout(limits.acquire_timeout)
+                        .connect_lazy_with(options),
+                ))
+            }
+        }
+    }
+}
+
+/// Run one block against whichever pool the store holds.
+///
+/// The three pools are the same API with three different Rust types, so the block is written once
+/// and instantiated per backend. Everything that genuinely differs between backends — the SQL text
+/// and the migration set — is chosen from the [`Dialect`] *before* this point, so nothing inside a
+/// block needs to branch on the backend again.
+macro_rules! with_pool {
+    ($backend:expr, |$pool:ident| $body:block) => {
+        match $backend {
+            Pool::Postgres($pool) => $body,
+            Pool::MySql($pool) => $body,
+            Pool::Sqlite($pool) => $body,
+        }
+    };
+}
+
+/// The database path and query string of a SQLite URL, i.e. what follows the scheme.
+///
+/// This mirrors sqlx's own parser because [`SqliteConnectOptions`] does not expose whether it was
+/// handed an in-memory database or a read-only file, and both change how the pool is built.
+fn sqlite_url_parts(url: &str) -> (&str, Option<&str>) {
+    let rest = url
+        .trim_start_matches("sqlite://")
+        .trim_start_matches("sqlite:");
+    rest.split_once('?')
+        .map_or((rest, None), |(database, params)| (database, Some(params)))
+}
+
+/// One `key=value` pair from a SQLite URL's query string.
+///
+/// Percent-decoding is skipped on purpose: no parameter inspected here is one that needs it.
+fn sqlite_param<'a>(params: Option<&'a str>, key: &str) -> Option<&'a str> {
+    params?.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == key).then_some(value)
+    })
+}
+
+/// Whether a SQLite URL names a private in-memory database rather than a file on disk.
+fn sqlite_is_in_memory(database: &str, params: Option<&str>) -> bool {
+    database == ":memory:" || matches!(sqlite_param(params, "mode"), Some("memory"))
+}
+
+/// Optional database-backed storage for calculator history.
+///
+/// A `Store` is always constructible: when no usable URL is configured the backend is `None` and
+/// every storage operation returns an error instead of panicking, so the MCP server still starts and
 /// serves the pure-computation tools.
 ///
-/// When the database is configured but unreachable, a circuit breaker keeps the arithmetic tools
-/// fast: after [`Limits::breaker_threshold`] connection failures, storage is skipped for
-/// [`Limits::breaker_cooldown`] instead of making every tool call wait out
+/// Which backend is in use follows from the URL's scheme (see [`Dialect`]); nothing else has to be
+/// configured. When the database is configured but unreachable, a circuit breaker keeps the
+/// arithmetic tools fast: after [`Limits::breaker_threshold`] connection failures, storage is
+/// skipped for [`Limits::breaker_cooldown`] instead of making every tool call wait out
 /// [`Limits::acquire_timeout`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Store {
-    pool: Option<PgPool>,
-    schema: OnceCell<()>,
+    backend: Option<Pool>,
+    schema: Arc<OnceCell<()>>,
     breaker: Arc<Mutex<Breaker>>,
     limits: Limits,
+}
+
+impl Default for Store {
+    /// Same as [`Store::disabled`]: storage off, limits at their defaults.
+    fn default() -> Self {
+        Self::disabled()
+    }
 }
 
 /// Connection-failure bookkeeping backing the graceful-degradation behaviour.
@@ -126,18 +412,18 @@ impl Store {
     /// Storage that is permanently off; every storage call fails fast with [`Self::DISABLED`].
     #[must_use]
     pub fn disabled() -> Self {
-        Self::with_limits(None, Limits::default())
+        Self::with_backend(None, Limits::default())
     }
 
     /// Message returned when storage is not configured.
-    pub const DISABLED: &'static str = "storage unavailable: no usable PostgreSQL URL is \
+    pub const DISABLED: &'static str = "storage unavailable: no usable database URL is \
         configured (set DATABASE_URL, --db-url, or [storage].url in a config file)";
 
     /// Build a store from resolved [`StorageConfig`].
     ///
     /// This is the normal entry point: the binary resolves configuration once at startup and hands
-    /// the storage section over. A missing or unparsable URL degrades to disabled storage with a
-    /// warning rather than failing.
+    /// the storage section over. A missing, unparsable or unsupported URL degrades to disabled
+    /// storage with a warning rather than failing.
     #[must_use]
     pub fn from_settings(storage: &StorageConfig) -> Self {
         match &storage.url {
@@ -178,27 +464,27 @@ impl Store {
         match Self::try_connect(url, limits) {
             Ok(store) => store,
             Err(error) => {
-                warn!(%error, "unusable PostgreSQL URL; serving calculator tools without history");
-                Self::with_limits(None, limits)
+                warn!(%error, "unusable database URL; serving calculator tools without history");
+                Self::with_backend(None, limits)
             }
         }
     }
 
-    fn try_connect(url: &str, limits: Limits) -> Result<Self, sqlx::Error> {
-        // The devcontainer database speaks plaintext TCP; being explicit avoids depending on the
-        // TLS feature set of sqlx and avoids a pointless SSL negotiation attempt.
-        let options = PgConnectOptions::from_str(url)?.ssl_mode(PgSslMode::Disable);
-        let pool = PgPoolOptions::new()
-            .max_connections(limits.max_connections)
-            .acquire_timeout(limits.acquire_timeout)
-            .connect_lazy_with(options);
-        Ok(Self::with_limits(Some(pool), limits))
+    fn try_connect(url: &str, limits: Limits) -> Result<Self, String> {
+        let dialect = Dialect::from_url(url)?;
+        Pool::connect(url, dialect, limits).map(|pool| Self::with_backend(Some(pool), limits))
     }
 
-    fn with_limits(pool: Option<PgPool>, limits: Limits) -> Self {
+    fn with_backend(backend: Option<Pool>, limits: Limits) -> Self {
         Self {
-            pool,
-            schema: OnceCell::const_new(),
+            backend,
+            // Shared with every clone, like `breaker`. `tokio::sync::OnceCell` clones to a *fresh,
+            // empty* cell, and `record_success` hands a clone to a spawned task — so a per-store
+            // cell would let that task run its own migration alongside the caller's. PostgreSQL
+            // hides that behind its advisory lock; SQLite has no migration lock at all, so both
+            // runs read an empty `_sqlx_migrations` and the loser fails with a UNIQUE violation on
+            // `version`.
+            schema: Arc::new(OnceCell::const_new()),
             breaker: Arc::default(),
             limits,
         }
@@ -207,7 +493,13 @@ impl Store {
     /// True when a database is configured, whether or not it is reachable right now.
     #[must_use]
     pub const fn is_configured(&self) -> bool {
-        self.pool.is_some()
+        self.backend.is_some()
+    }
+
+    /// The backend in use, or `None` when storage is disabled.
+    #[must_use]
+    pub fn dialect(&self) -> Option<Dialect> {
+        self.backend.as_ref().map(Pool::dialect)
     }
 
     /// The limits this store was built with.
@@ -282,19 +574,20 @@ impl Store {
     }
 
     /// Apply pending migrations once per process, retrying on the next call if the database is
-    /// not up yet. This is why startup never blocks on Postgres.
-    async fn ensure_schema(&self) -> Result<&PgPool, String> {
-        let pool = self.pool.as_ref().ok_or(Self::DISABLED)?;
+    /// not up yet. This is why startup never blocks on the database.
+    async fn ensure_schema(&self) -> Result<&Pool, String> {
+        let backend = self.backend.as_ref().ok_or(Self::DISABLED)?;
+        let dialect = backend.dialect();
         self.check_breaker()?;
         self.schema
             .get_or_try_init(|| async {
                 // Callers queue behind this init, so re-check the breaker here: once it opens,
                 // the rest of the queue fails instantly instead of each retrying the connection.
                 self.check_breaker()?;
-                debug!("applying database migrations");
+                debug!(dialect = dialect.label(), "applying database migrations");
                 // MigrateError wraps the underlying sqlx error, so unwrap it for the breaker:
                 // a missing database must trip it, a bad migration file must not.
-                match sqlx::migrate!("./migrations").run(pool).await {
+                match with_pool!(backend, |pool| { dialect.migrations().run(pool).await }) {
                     Ok(()) => {
                         self.note_reachable();
                         Ok(())
@@ -312,7 +605,7 @@ impl Store {
                 }
             })
             .await?;
-        Ok(pool)
+        Ok(backend)
     }
 
     /// Append a successful call, without blocking the caller.
@@ -357,54 +650,71 @@ impl Store {
         result: Option<String>,
         error: Option<String>,
     ) -> Result<(), String> {
-        let pool = self.ensure_schema().await?;
-        let executed = sqlx::query(
-            "INSERT INTO calc_history (operation, inputs, result, error) VALUES ($1, $2, $3, $4)",
-        )
-        .bind(operation)
-        .bind(inputs)
-        .bind(result)
-        .bind(error)
-        .execute(pool)
-        .await;
+        let backend = self.ensure_schema().await?;
+        let dialect = backend.dialect();
+        let sql = dialect.insert_sql();
+        let created_at = Utc::now();
+        // `()` as the normalised result: an insert's row count is not interesting, but the three
+        // `QueryResult` types are not the same type, so the arms need a common one.
+        let executed = with_pool!(backend, |pool| {
+            sqlx::query(&sql)
+                .bind(operation)
+                .bind(inputs)
+                .bind(result)
+                .bind(error)
+                .bind(created_at)
+                .execute(pool)
+                .await
+                .map(|_| ())
+        });
         self.finish(executed, "failed to insert history")
-            .map(|_| ())
     }
 
     /// Most recent entries first.
     pub async fn list(&self, limit: i64) -> Result<Vec<HistoryEntry>, String> {
-        let pool = self.ensure_schema().await?;
-        let fetched = sqlx::query_as::<_, HistoryEntry>(
-            "SELECT id, operation, inputs, result, error, created_at
-             FROM calc_history
-             ORDER BY created_at DESC, id DESC
-             LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(pool)
-        .await;
+        let backend = self.ensure_schema().await?;
+        let sql = backend.dialect().list_sql();
+        let fetched = with_pool!(backend, |pool| {
+            sqlx::query_as::<_, HistoryEntry>(&sql)
+                .bind(limit)
+                .fetch_all(pool)
+                .await
+        });
         self.finish(fetched, "failed to read history")
     }
 
     /// Drop all history and report how many rows were removed.
     ///
-    /// `DELETE` rather than the faster `TRUNCATE`: PostgreSQL's `TRUNCATE` command tag carries no row
-    /// count, so `rows_affected` would always be 0 and the tool would report a lie.
+    /// `DELETE` rather than the faster `TRUNCATE`, which exists on all three backends but reports no
+    /// row count on PostgreSQL and MySQL, so `rows_affected` would be 0 and the tool would report a
+    /// lie.
     pub async fn clear(&self) -> Result<u64, String> {
-        let pool = self.ensure_schema().await?;
-        let result = sqlx::query("DELETE FROM calc_history").execute(pool).await;
-        self.finish(result, "failed to clear history")
-            .map(|result| result.rows_affected())
+        let backend = self.ensure_schema().await?;
+        let sql = backend.dialect().delete_sql();
+        // Each driver has its own `QueryResult` type, so the row count is taken inside the block to
+        // give all three arms one common return type.
+        let executed = with_pool!(backend, |pool| {
+            sqlx::query(sql)
+                .execute(pool)
+                .await
+                .map(|result| result.rows_affected())
+        });
+        self.finish(executed, "failed to clear history")
     }
 
-    /// Verify the database answers, then report the stored row count.
+    /// Verify the database answers, then report the stored row count and which backend answered.
     pub async fn status(&self) -> Result<String, String> {
-        let pool = self.ensure_schema().await?;
-        let counted = sqlx::query_as::<_, (i64,)>("SELECT count(*) FROM calc_history")
-            .fetch_one(pool)
-            .await;
+        let backend = self.ensure_schema().await?;
+        let dialect = backend.dialect();
+        let sql = dialect.count_sql();
+        let counted = with_pool!(backend, |pool| {
+            sqlx::query_as::<_, (i64,)>(sql).fetch_one(pool).await
+        });
         let (rows,) = self.finish(counted, "database unreachable")?;
-        Ok(format!("database reachable, {rows} stored calculations"))
+        Ok(format!(
+            "{} database reachable, {rows} stored calculations",
+            dialect.label()
+        ))
     }
 }
 
@@ -413,7 +723,26 @@ mod tests {
     use super::*;
 
     // Only behaviour that needs private access lives here; the public `Store` surface is covered
-    // by tests/store_offline.rs, and the tool-facing behaviour by tests/stdio_protocol.rs.
+    // by tests/store_offline.rs, the protocol by tests/stdio_protocol.rs, and a real round-trip
+    // against SQLite by tests/sqlite_backend.rs.
+
+    #[tokio::test]
+    async fn clones_share_one_schema_cell() {
+        // `tokio::sync::OnceCell` clones to a fresh, *empty* cell when it has no value yet, and
+        // every history write hands a clone to a spawned task before any migration has run. With a
+        // per-store cell that task migrates on its own, racing the caller's migration: harmless
+        // behind PostgreSQL's advisory lock, a UNIQUE violation on `_sqlx_migrations.version` on
+        // SQLite, which has no migration lock at all.
+        let store = Store::connect("sqlite::memory:");
+        // Cloned first, exactly as `record_success` does.
+        let detached = store.clone();
+        store.schema.get_or_init(|| async {}).await;
+
+        assert!(
+            detached.schema.initialized(),
+            "a clone taken before the first migration must see that migration"
+        );
+    }
 
     #[test]
     fn successful_call_resets_the_breaker() {
@@ -435,5 +764,121 @@ mod tests {
         let store = Store::disabled();
         store.note_failure(&sqlx::Error::RowNotFound);
         assert_eq!(store.breaker.lock().unwrap().failures, 0);
+    }
+
+    #[test]
+    fn url_scheme_selects_the_backend() {
+        assert_eq!(
+            Dialect::from_url("postgres://mcp:mcp@db:5432/mcp"),
+            Ok(Dialect::Postgres)
+        );
+        assert_eq!(
+            Dialect::from_url("postgresql://mcp:mcp@db/mcp"),
+            Ok(Dialect::Postgres)
+        );
+        assert_eq!(
+            Dialect::from_url("mysql://mcp:mcp@db:3306/mcp"),
+            Ok(Dialect::MySql)
+        );
+        assert_eq!(
+            Dialect::from_url("mariadb://mcp:mcp@db/mcp"),
+            Ok(Dialect::MySql)
+        );
+        assert_eq!(Dialect::from_url("sqlite://mcp.db"), Ok(Dialect::Sqlite));
+        assert_eq!(Dialect::from_url("SQLITE::memory:"), Ok(Dialect::Sqlite));
+    }
+
+    #[test]
+    fn a_url_without_a_supported_scheme_is_rejected_by_name() {
+        // The message has to name the alternatives, otherwise a typo looks like "storage off".
+        let no_scheme = Dialect::from_url("mcp.db").unwrap_err();
+        assert!(no_scheme.contains("sqlite"), "{no_scheme}");
+
+        let typo = Dialect::from_url("postgresqls://db/mcp").unwrap_err();
+        assert!(typo.contains("postgresqls"), "{typo}");
+        for scheme in Dialect::SCHEMES {
+            assert!(typo.contains(scheme), "{typo} should list {scheme}");
+        }
+    }
+
+    #[test]
+    fn each_backend_gets_its_own_placeholder_spelling() {
+        assert_eq!(
+            Dialect::Postgres.insert_sql(),
+            "INSERT INTO calc_history (operation, inputs, result, error, created_at) \
+             VALUES ($1, $2, $3, $4, $5)"
+        );
+        assert_eq!(
+            Dialect::MySql.insert_sql(),
+            "INSERT INTO calc_history (operation, inputs, result, error, created_at) \
+             VALUES (?, ?, ?, ?, ?)"
+        );
+        assert_eq!(
+            Dialect::Sqlite.list_sql(),
+            Dialect::MySql.list_sql(),
+            "MySQL and SQLite share the '?' placeholder style"
+        );
+        assert!(Dialect::Postgres.list_sql().contains("LIMIT $1"));
+    }
+
+    #[test]
+    fn each_backend_has_its_own_migration_set() {
+        // Each set is embedded from its own directory, so they cannot silently drift into one
+        // shared file. Version 1 must exist in all three or a backend would migrate to nothing.
+        for dialect in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
+            let migrator = dialect.migrations();
+            assert_eq!(
+                migrator.iter().map(|m| m.version).collect::<Vec<_>>(),
+                [1],
+                "{} should have exactly migration 1",
+                dialect.label()
+            );
+        }
+        // The PostgreSQL file is unchanged from when it was the only migration, so databases that
+        // already applied it keep matching its checksum instead of failing with VersionMismatch.
+        assert_eq!(
+            POSTGRES_MIGRATIONS.iter().next().map(|m| &*m.sql),
+            Some(include_str!("../migrations/postgres/0001_calc_history.sql")),
+        );
+    }
+
+    #[test]
+    fn sqlite_urls_are_split_like_sqlx_splits_them() {
+        assert_eq!(sqlite_url_parts("sqlite::memory:"), (":memory:", None));
+        assert_eq!(sqlite_url_parts("sqlite://mcp.db"), ("mcp.db", None));
+        assert_eq!(
+            sqlite_url_parts("sqlite:///var/lib/mcp.db"),
+            ("/var/lib/mcp.db", None)
+        );
+        assert_eq!(
+            sqlite_url_parts("sqlite://mcp.db?mode=ro"),
+            ("mcp.db", Some("mode=ro"))
+        );
+    }
+
+    #[test]
+    fn sqlite_query_parameters_are_read_without_percent_decoding() {
+        let params = Some("mode=rwc&cache=shared");
+        assert_eq!(sqlite_param(params, "mode"), Some("rwc"));
+        assert_eq!(sqlite_param(params, "cache"), Some("shared"));
+        assert_eq!(sqlite_param(params, "immutable"), None);
+        assert_eq!(sqlite_param(None, "mode"), None);
+    }
+
+    #[test]
+    fn in_memory_sqlite_is_recognised_in_both_spellings() {
+        assert!(sqlite_is_in_memory(":memory:", None));
+        assert!(sqlite_is_in_memory("", Some("mode=memory")));
+        assert!(!sqlite_is_in_memory("mcp.db", Some("mode=rwc")));
+    }
+
+    #[test]
+    fn a_read_only_sqlite_url_is_not_created_behind_the_users_back() {
+        // `mode=ro`/`mode=rw` are the URL's way of saying the file must already exist, so the pool
+        // must not add CREATE to the open flags for them.
+        assert!(matches!(
+            sqlite_param(Some("mode=ro"), "mode"),
+            Some("ro" | "rw")
+        ));
     }
 }

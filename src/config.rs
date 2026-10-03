@@ -38,7 +38,8 @@ pub const DEFAULT_LOG_FILTER: &str = "info";
 pub mod env_keys {
     /// Path to the TOML config file.
     pub const CONFIG: &str = "MCP_CONFIG";
-    /// PostgreSQL URL; unchanged from before config files existed.
+    /// Database URL; unchanged from before config files existed. The scheme picks the backend:
+    /// `postgres`, `postgresql`, `mysql`, `mariadb` or `sqlite`.
     pub const DATABASE_URL: &str = "DATABASE_URL";
     /// Bind address for the SSE transport.
     pub const SSE_ADDRESS: &str = "MCP_SSE_ADDRESS";
@@ -72,7 +73,10 @@ pub struct ServerConfig {
     pub log_filter: String,
 }
 
-/// PostgreSQL history settings. `url: None` means storage is disabled.
+/// Calculation-history settings. `url: None` means storage is disabled.
+///
+/// Which backend that URL selects is not configured here: the scheme decides it, and
+/// [`crate::db::Dialect`] owns the rest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageConfig {
     /// Database URL; `None` disables storage entirely.
@@ -90,8 +94,8 @@ pub struct StorageConfig {
 }
 
 impl StorageConfig {
-    /// Whether a URL was configured at all. An unparsable URL still counts as configured here;
-    /// [`crate::db::Store`] is what decides it is unusable.
+    /// Whether a URL was configured at all. An unparsable or unsupported URL still counts as
+    /// configured here; [`crate::db::Store`] is what decides it is unusable.
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.url.is_some()
@@ -243,7 +247,7 @@ impl Cli {
     #[must_use]
     pub fn usage() -> &'static str {
         "\
-poc-rust-mcp — MCP calculator server with PostgreSQL-backed history
+poc-rust-mcp — MCP calculator server with a database-backed history
 
 Usage:
   poc-rust-mcp                Serve MCP over stdio (default, for client subprocesses)
@@ -253,7 +257,7 @@ Usage:
 Configuration, highest precedence first:
   1. command-line flags
        --config <PATH>  TOML config file (also MCP_CONFIG)
-       --db-url <URL>   PostgreSQL URL (also DATABASE_URL)
+       --db-url <URL>   database URL (also DATABASE_URL)
        --sse [ADDR]     bind address for SSE (also MCP_SSE_ADDRESS)
   2. environment variables
   3. the TOML config file, if one was named
@@ -262,8 +266,17 @@ Configuration, highest precedence first:
   No config file is required. Precedence for a setting is
   flag > environment > file > default.
 
+Database:
+  The URL's scheme picks the backend; nothing else is configured.
+    postgres://mcp:mcp@127.0.0.1:5432/mcp   PostgreSQL
+    mysql://mcp:mcp@127.0.0.1:3306/mcp      MySQL or MariaDB
+    sqlite://mcp.db  (or sqlite::memory:)   SQLite, no server needed
+  Unset, unparsable or unreachable = storage disabled, calculator tools still work.
+  TLS follows the URL and the driver's own default; add ?sslmode=require (PostgreSQL)
+  or ?ssl-mode=REQUIRED (MySQL) if the server demands it.
+
 Environment:
-  DATABASE_URL   PostgreSQL URL for calculation history, e.g.
+  DATABASE_URL   database URL for calculation history, e.g.
                  postgres://mcp:mcp@127.0.0.1:5432/mcp
                  Unset or unreachable = storage disabled, calculator tools still work
   RUST_LOG       Log filter, e.g. RUST_LOG=debug (logs go to stderr)

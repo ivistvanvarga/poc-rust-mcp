@@ -1,10 +1,12 @@
-# podman-compose stack for local development: a Rust devcontainer plus PostgreSQL.
+# podman-compose stack for local development: a Rust devcontainer plus PostgreSQL and MySQL.
 #
 #   podman-compose -f .devcontainer/compose.yaml up -d --build
 #   podman-compose -f .devcontainer/compose.yaml exec app cargo test
 #   podman-compose -f .devcontainer/compose.yaml down -v
 #
-# Note: `depends_on` here does NOT wait for PostgreSQL to accept connections. That is
+# SQLite needs no service: `cargo run -- --db-url sqlite://mcp.db` from the app container works.
+#
+# Note: `depends_on` here does NOT wait for the databases to accept connections. That is
 # deliberate — the MCP server connects lazily and degrades gracefully when the database is
 # not ready yet (src/db.rs), so the app container never has to block on startup.
 services:
@@ -27,6 +29,26 @@ services:
       retries: 20
       start_period: 5s
 
+  mysql:
+    # Only started to exercise the MySQL/MariaDB backend; PostgreSQL remains the default below.
+    # 8.0.16+ is the first release that enforces CHECK constraints, which the schema relies on.
+    image: docker.io/library/mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: mcp
+      MYSQL_DATABASE: mcp
+      MYSQL_USER: mcp
+      MYSQL_PASSWORD: mcp
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysqldata:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u mcp -pmcp"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
   app:
     build:
       # See Dockerfile for why this image exists instead of using the base image directly.
@@ -35,6 +57,7 @@ services:
     working_dir: /workspace
     environment:
       # `db` is the compose service name; must match the service above, not localhost.
+      # Switch to `mysql://mcp:mcp@mysql:3306/mcp` to use the MySQL backend instead.
       DATABASE_URL: postgres://mcp:mcp@db:5432/mcp
       RUST_LOG: info
       CARGO_TERM_COLOR: always
@@ -45,7 +68,9 @@ services:
       - ..:/workspace:z
     depends_on:
       - db
+      - mysql
     command: ["sleep", "infinity"]
 
 volumes:
   pgdata:
+  mysqldata:

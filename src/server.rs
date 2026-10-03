@@ -111,7 +111,7 @@ impl Calculator {
         ))
     }
 
-    #[tool(description = "Report whether PostgreSQL storage is configured and reachable")]
+    #[tool(description = "Report whether database storage is configured and reachable")]
     async fn db_status(&self) -> Result<String, String> {
         if !self.store.is_configured() {
             return Err(Store::DISABLED.to_owned());
@@ -133,7 +133,7 @@ impl Calculator {
             .join("\n"))
     }
 
-    #[tool(description = "Delete all recorded calculations from PostgreSQL")]
+    #[tool(description = "Delete all recorded calculations from the database")]
     async fn clear_calc_history(&self) -> Result<String, String> {
         let removed = self.store.clear().await?;
         Ok(format!("deleted {removed} recorded calculations"))
@@ -151,9 +151,9 @@ impl ServerHandler for Calculator {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
             },
             instructions: Some(
-                "A calculator server. Every arithmetic call is recorded to PostgreSQL when \
-                 DATABASE_URL is configured; use db_status, calc_history and clear_calc_history \
-                 to inspect storage."
+                "A calculator server. Every arithmetic call is recorded to the configured \
+                 database (PostgreSQL, MySQL/MariaDB or SQLite) when DATABASE_URL is set; use \
+                 db_status, calc_history and clear_calc_history to inspect storage."
                     .to_owned(),
             ),
         }

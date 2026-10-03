@@ -20,11 +20,20 @@
 # log_filter = "info"
 
 [storage]
-# PostgreSQL URL. Leave unset (or blank) to disable storage: the server still starts and every
+# Database URL. Leave unset (or blank) to disable storage: the server still starts and every
 # arithmetic tool still works, while the three history tools report that storage is off.
 # Overridden by --db-url or DATABASE_URL.
 #
-# Note: the connection is made with TLS disabled, which suits a local database.
+# The URL's scheme picks the backend; there is no separate driver setting. Supported schemes:
+#
+#   postgres://mcp:mcp@127.0.0.1:5432/mcp   PostgreSQL   (also postgresql://)
+#   mysql://mcp:mcp@127.0.0.1:3306/mcp      MySQL/MariaDB (also mariadb://)
+#   sqlite://mcp.db                         SQLite file, created if missing
+#   sqlite::memory:                         SQLite in-process, nothing on disk
+#
+# TLS follows the URL and the driver's own default, which stays plaintext when sqlx is built
+# without a TLS feature — fine for a local container. For a managed database that requires it, add
+# ?sslmode=require (PostgreSQL) or ?ssl-mode=REQUIRED (MySQL).
 # url = "postgres://mcp:mcp@127.0.0.1:5432/mcp"
 
 # Maximum pooled connections. Must be at least 1. Default: 5

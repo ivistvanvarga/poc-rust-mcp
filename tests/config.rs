@@ -14,7 +14,7 @@ use std::{
 
 use poc_rust_mcp::{
     config::{Cli, Config, ConfigError, Env, MapEnv, StorageConfig, SystemEnv, env_keys},
-    db::{Limits, Store},
+    db::{Dialect, Limits, Store},
     server::clamp_history_limit,
 };
 
@@ -423,6 +423,10 @@ fn usage_documents_the_layers_and_the_config_file() {
         env_keys::CONFIG,
         env_keys::DATABASE_URL,
         "config.example.toml",
+        // The backend is chosen by URL scheme, so the help text has to list them.
+        "postgres://",
+        "mysql://",
+        "sqlite://",
     ] {
         assert!(
             usage.contains(expected),
@@ -456,6 +460,35 @@ async fn resolved_storage_settings_reach_the_store() {
 }
 
 #[tokio::test]
+async fn the_resolved_url_reaches_the_store_as_the_right_backend() {
+    // Configuration is scheme-agnostic: it passes the URL through and lets the store pick a driver.
+    // Whichever layer supplied it must not change that, so this goes through all four.
+    let cases = [
+        ("postgres://flag:flag@db:5432/flag", Dialect::Postgres),
+        ("mysql://flag:flag@db:3306/flag", Dialect::MySql),
+        ("sqlite://flag.db", Dialect::Sqlite),
+    ];
+
+    for (url, expected) in cases {
+        let file = TempFile::new("[storage]\nurl = \"sqlite://ignored.db\"\n");
+        let config = resolve(
+            &cli(&[
+                "--config",
+                file.path().to_str().expect("utf-8 path"),
+                "--db-url",
+                url,
+            ]),
+            &MapEnv::new().with(env_keys::DATABASE_URL, "postgres://env:env@db/env"),
+        )
+        .expect("the URL should pass through every layer");
+
+        let store = Store::from_settings(&config.storage);
+        assert!(store.is_configured(), "{url}");
+        assert_eq!(store.dialect(), Some(expected), "{url}");
+    }
+}
+
+#[tokio::test]
 async fn an_unusable_url_degrades_to_disabled_storage_rather_than_failing() {
     let config = resolve(
         &no_cli(),
@@ -465,6 +498,7 @@ async fn an_unusable_url_degrades_to_disabled_storage_rather_than_failing() {
 
     let store = Store::from_settings(&config.storage);
     assert!(!store.is_configured());
+    assert_eq!(store.dialect(), None);
     assert!(
         Store::DISABLED.contains("DATABASE_URL"),
         "the message should tell the user what to set: {}",

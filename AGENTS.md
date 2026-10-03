@@ -9,8 +9,118 @@ Crate `poc-rust-mcp` (edition 2024) with **both** a lib and a bin target:
 - `src/main.rs` — thin transport wiring (tracing, stdio/SSE), imports the lib rather than declaring
   `mod` items itself; all argument parsing lives in `config`.
 - `src/config.rs` — layered configuration, `src/server.rs` — the `Calculator` server and all tools,
-  `src/db.rs` — all PostgreSQL access, `migrations/` — sqlx migrations,
-  `config.example.toml` — the documented example (copy to the git-ignored `config.toml`).
+  `src/db.rs` — all database access, `migrations/{postgres,mysql,sqlite}/` — per-dialect sqlx
+  migrations, `config.example.toml` — the documented example (copy to the git-ignored `config.toml`).
+
+## One URL, three backends
+
+The URL's **scheme** picks the backend and nothing else is configured:
+
+| Scheme | `Dialect` | sqlx driver |
+| --- | --- | --- |
+| `postgres://`, `postgresql://` | `Dialect::Postgres` | `PgPool` |
+| `mysql://`, `mariadb://` | `Dialect::MySql` | `MySqlPool` |
+| `sqlite://`, `sqlite::memory:` | `Dialect::Sqlite` | `SqlitePool` |
+
+### Do NOT reach for `sqlx::Any`
+
+The obvious way to hold "whichever pool" is `AnyPool`, and it does not work: `AnyValueKind` only
+covers null/bool/smallint/integer/bigint/real/double/text/blob, and `Any`'s Postgres backend maps
+`PgType` onto those kinds with a `match` — `Json`, `Jsonb` and every timestamp type hit the catch-all
+arm and error out (`Any driver does not support the Postgres type …`). `HistoryEntry` has a JSON
+column and a `TIMESTAMPTZ`, so it cannot be read back through `Any` at all.
+
+Hence the private `enum Pool` plus the `with_pool!` macro in `db.rs`: three concrete pool types, one
+block of query code instantiated three times. Only the *pool type* is abstracted; everything that
+actually differs between backends (SQL text, migrations) is chosen from the `Dialect` **before** the
+macro, so nothing inside a block branches on the backend again.
+
+Two consequences to remember:
+
+- Each arm needs one return type, and `PgQueryResult`/`MySqlQueryResult`/`SqliteQueryResult` are three
+  unrelated types. Normalise inside the block (`.map(|r| r.rows_affected())`, `.map(|_| ())`).
+- Placeholders are the only SQL syntax that differs, and `Dialect::placeholder` owns that: `$1`..`$5`
+  for PostgreSQL, `?` for MySQL and SQLite. `Dialect::insert_sql`/`list_sql` build the text with
+  `format!`; the remaining SQL is backend-independent.
+- `with_pool!` matches `|$pool:ident| $body:block` — a `block` fragment is the only one that may be
+  repeated, which is the whole trick. A bare expression does not match; wrap it in braces.
+
+### Migrations are per dialect, embedded at compile time
+
+`migrations/0001_calc_history.sql` became `migrations/postgres/0001_calc_history.sql` **byte for
+byte**, because sqlx stores that file's SHA-384 as the migration checksum. Verify before touching it:
+
+```bash
+sha384sum migrations/postgres/0001_calc_history.sql
+podman exec <pg-container> psql -U mcp -d mcp -tAc \
+  "SELECT encode(checksum,'hex') FROM _sqlx_migrations WHERE version = 1"
+```
+
+Adding migration `0002_*` means adding it to **all three** directories. `Migrator` is *not* generic
+in sqlx 0.8.6 — dispatch is via the `Migrate`/`MigrateDatabase` traits — which is what lets one `db.rs`
+carry three sets:
+
+```rust
+static POSTGRES_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/postgres");
+```
+
+The macros embed the SQL with `include_str!` at build time, so there is still no filesystem access at
+runtime and no `DATABASE_URL`-dependent build step. `migrations/` must contain **no** top-level
+`.sql`: `sqlx::migrate!("./migrations")` would silently resolve to zero migrations.
+
+MySQL notes: 8.0.16+/MariaDB 10.2.1+ are required, for the enforced `CHECK` constraint and for `JSON`
+columns. MySQL has no `CREATE INDEX IF NOT EXISTS` and its DDL is non-transactional, so a partial
+failure is recovered by the `CREATE TABLE IF NOT EXISTS` on the retry being a no-op.
+
+### `created_at` is written by the server, on purpose
+
+Every `0001_*` migration has `created_at NOT NULL`, but the `INSERT` binds `Utc::now()` rather than
+relying on the column default, and SQLite has **no** `DEFAULT` at all. This is not redundancy:
+
+- SQLite's `CURRENT_TIMESTAMP` writes `2026-10-03 12:00:00`, whose space separator sorts **before** the
+  `T` of RFC 3339. Mixing the two silently corrupts `ORDER BY created_at DESC`, because SQLite
+  compares TEXT lexicographically.
+- MySQL's `TIMESTAMP` converts between the session time zone and UTC on the way in *and* out.
+  `DATETIME` does not, so the schema uses `DATETIME(6)`.
+
+Ties are real (both defaults have second resolution), which is why the query is
+`ORDER BY created_at DESC, id DESC` — keep both keys.
+
+### SQLite specifics worth knowing
+
+- `SqliteConnectOptions` exposes no getter for "in-memory" or "read-only", so `sqlite_url_parts` /
+  `sqlite_param` re-parse the URL exactly as sqlx does. Both are unit-tested in `db.rs`.
+- An **in-memory** store is forced to `max_connections(1)`. SQLite's shared-cache mode takes
+  *table*-level locks that `busy_timeout` cannot wait out, so a larger pool turns a contended write
+  into a failed one. A *file* store keeps the configured pool size — which also means the migration
+  race described below only reproduces on a file database.
+- `create_if_missing(true)` unless the URL pins `mode=ro`/`mode=rw`, so `sqlite://mcp.db` works on a
+  fresh checkout but a read-only URL never conjures a database behind the user's back.
+- `busy_timeout` is tied to `acquire_timeout`; sqlx's own default is 5s, which would outlast the
+  budget this store promises callers.
+
+### TLS
+
+`Pool::connect` deliberately does **not** touch `ssl_mode` on any driver — the URL and the driver's
+own default decide. sqlx is built here without a TLS feature, and both `PgSslMode::Prefer` and
+`MySqlSslMode::Preferred` check `tls::available()` first and stay on plaintext when it is false (see
+`sqlx-postgres/src/connection/tls.rs`, `sqlx-mysql/src/connection/tls.rs`), so local containers keep
+working and enabling a TLS feature later upgrades automatically. A managed database that *requires*
+TLS needs `?sslmode=require` / `?ssl-mode=REQUIRED` in the URL.
+
+### `Store::schema` MUST be `Arc<OnceCell<()>>`
+
+A real bug that stayed latent while storage was PostgreSQL-only, so it is easy to reintroduce.
+`tokio::sync::OnceCell` implements `Clone` by **copying the value if set and otherwise producing a
+fresh, empty cell**. `record_success` hands `self.clone()` to a `tokio::spawn`, so with a per-store
+cell the detached task ran its *own* migration alongside the caller's. PostgreSQL hid this behind
+`Migrator::lock`'s advisory lock; SQLite's `Migrate::lock` is a literal no-op, so both runs read an
+empty `_sqlx_migrations` and the loser failed with `UNIQUE constraint failed: _sqlx_migrations.version`
+— surfacing as a silently dropped history row.
+
+`db::tests::clones_share_one_schema_cell` guards it, and it clones *before* the first migration on
+purpose: a clone taken afterwards copies the value and passes either way. Keep the `Arc` for the same
+reason `breaker` has one.
 
 ## rmcp is pinned to 0.1 — the 0.1 API is not the 3.x API
 
@@ -42,6 +152,8 @@ cargo run -- --sse 127.0.0.1:8000   # HTTP+SSE, endpoints GET /sse, POST /messag
 RUST_LOG=debug cargo run        # logs go to stderr; default filter is info
 cargo run -- --config config.toml     # TOML config file (also MCP_CONFIG)
 cargo run -- --db-url postgres://…    # beats DATABASE_URL
+cargo run -- --db-url mysql://…       # same flag, different backend
+cargo run -- --db-url sqlite://mcp.db # …including SQLite, which needs no server
 ```
 
 `--help` prints the full flag/environment/config-file list. Tracing is initialised *after*
@@ -58,6 +170,11 @@ cargo build
   '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'; sleep 1; } \
   | RUST_LOG=warn ./target/debug/poc-rust-mcp
 ```
+
+`scripts/verify-backend.sh <url>` is the same idea plus `db_status`/`calc_history`/
+`clear_calc_history`, for the manual checks a live PostgreSQL or MySQL needs. Responses may arrive
+**out of id order** — history writes are fire-and-forget, so a tool result can beat a later tool
+result. That is not a bug; do not "fix" it by awaiting the write.
 
 ## ServerInfo defaults are wrong for us
 
@@ -87,16 +204,18 @@ Precedence is **flag > environment > file > default**, resolved once at startup 
 - Tests must **not** use `unsafe { std::env::set_var }` (edition 2024). `Config::resolve` takes
   `&dyn Env`, and `MapEnv` injects values for tests. That is why the trait exists.
 
-## Postgres storage
+## Storage
 
 All SQL lives in `src/db.rs`; tools never touch sqlx types. The limits are no longer constants —
 they come from `config::StorageConfig` via `db::Limits`.
 
-- **Missing/unparsable URL ⇒ storage disabled.** The server still starts and every arithmetic tool
-  still works; storage tools return an error content. This is deliberate.
+- **Missing/unparsable/unsupported URL ⇒ storage disabled.** The server still starts and every
+  arithmetic tool still works; storage tools return an error content. This is deliberate. An unknown
+  *scheme* is not a guess: `Dialect::from_url` names the accepted schemes in the warning, so
+  `mysqls://` reads as a typo rather than as "storage is merely off".
 - **Migrations are applied lazily**, on the first storage call, and retried until they succeed —
-  never at startup. Add a new numbered file in `migrations/`; never edit an applied one
-  (`VersionMismatch`).
+  never at startup. Add a new numbered file to **all three** `migrations/*/` directories; never edit
+  an applied one (`VersionMismatch`, checked by SHA-384).
 - **History writes are fire-and-forget** (`tokio::spawn` in `record_success`/`record_failure`) so
   arithmetic tools never block on the database. Consequence: a row can be lost if the process exits
   immediately after the tool returns. Do not "fix" this by awaiting the insert.
@@ -106,24 +225,28 @@ they come from `config::StorageConfig` via `db::Limits`.
   deliberately excludes
   query-level errors so a bad query cannot disable storage. The check is repeated *inside* the
   migration `OnceCell` so callers already queued behind it fail fast instead of each retrying.
-- `clear_calc_history` uses `DELETE`, **not** `TRUNCATE`: Postgres' `TRUNCATE` command tag carries
-  no row count, so `rows_affected` is always 0 and the tool would report a lie.
+- `clear_calc_history` uses `DELETE`, **not** `TRUNCATE`: `TRUNCATE` reports no row count on
+  PostgreSQL or MySQL, so `rows_affected` would always be 0 and the tool would report a lie.
 - sqlx runs with `default-features = false` and **no compile-time checked queries** — `query_as` plus
   `#[derive(FromRow)]`. That is intentional: `query!` would require `DATABASE_URL` or a committed
   `.sqlx` offline cache at build time. Adding a new sqlx capability may mean enabling another
-  feature (`json` is required for `serde_json::Value` columns).
+  feature (`json` is required for `serde_json::Value` columns — including on SQLite, where JSON is
+  just TEXT; `chrono` for `DateTime<Utc>`; `sqlite` is **bundled**, so it builds SQLite from C source
+  and needs a C compiler).
 
 ## Devcontainer (podman-compose)
 
 ```bash
-podman-compose -f .devcontainer/compose.yaml up -d      # db + app
+podman-compose -f .devcontainer/compose.yaml up -d      # db + mysql + app
 podman-compose -f .devcontainer/compose.yaml exec app cargo test
 podman-compose -f .devcontainer/compose.yaml exec db psql -U mcp -d mcp
-podman-compose -f .devcontainer/compose.yaml down -v     # -v also drops the pgdata volume
+podman-compose -f .devcontainer/compose.yaml exec mysql mysql -u mcp -pmcp mcp
+podman-compose -f .devcontainer/compose.yaml down -v     # -v also drops the pgdata/mysqldata volumes
 ```
 
-- DB is `mcp`/`mcp`/`mcp`, published on host port 5432, data in the `pgdata` volume.
-- `depends_on` does **not** wait for Postgres to accept connections — podman-compose does not
+- `db` is `mcp`/`mcp`/`mcp` on host port 5432 (data in `pgdata`); `mysql` is the same on host port
+  3306 (data in `mysqldata`). SQLite needs no service at all.
+- `depends_on` does **not** wait for either database to accept connections — podman-compose does not
   honour health conditions, and the app must not block on startup anyway (see lazy migration).
 - `.devcontainer/Dockerfile` exists for exactly one reason: the base Rust image sets `PATH` via
   ENV, but Debian's `/etc/profile` reassigns `PATH` for login shells, so `cargo` disappears in
@@ -131,33 +254,43 @@ podman-compose -f .devcontainer/compose.yaml down -v     # -v also drops the pgd
 - The `:z` on the `/workspace` bind mount is required on SELinux hosts; without it the container is
   denied access to the mounted repo.
 - The compose `app` service sets `DATABASE_URL` for `db`, which still works: it is an env-layer key
-  with no config file involved.
+  with no config file involved. Edit that one value to point at `mysql://mcp:mcp@mysql:3306/mcp`.
 - `rust-toolchain.toml` pins `stable`, so the container rustup-downloads the current stable on
   first use even though the image ships 1.98.1. Version drift between host and container is
   expected; both build clean.
 
 ## Tests
 
-Three layers, and each assertion lives in exactly one of them — do not duplicate:
+Four layers, and each assertion lives in exactly one of them — do not duplicate:
 
 - `tests/stdio_protocol.rs` spawns the **real binary** over stdio and speaks raw JSON-RPC. This is
   the only layer that proves the protocol itself works (capabilities, `tools/list`, argument
   validation, tool errors vs JSON-RPC errors, stdout purity).
 - `tests/store_offline.rs` exercises the public `Store`/`HistoryEntry` surface **without** a live
-  database: disabled storage, unparsable URLs, bounded failure, breaker tripping, fire-and-forget
-  writes.
+  database: scheme→backend selection, disabled storage, unparsable and unsupported URLs, bounded
+  failure, breaker tripping, fire-and-forget writes. Runs against a dead PostgreSQL *and* a dead
+  MySQL URL, so the degradation guarantees are not proved for one driver only.
+- `tests/sqlite_backend.rs` is the only layer that needs a **real, working** database, and SQLite is
+  the only one that can be: embedded, in-process, nothing to install. It covers migrations, a JSON
+  and a timestamp column surviving a round trip, newest-first ordering, `DELETE` row counts, and a
+  file-backed database persisting across two stores.
 - `tests/config.rs` pins the layering: precedence, defaults with no file at all, blank-value
   handling, rejected unknown keys and out-of-range values, CLI parsing, and that resolved settings
-  reach the `Store`.
+  and the resolved URL's backend reach the `Store`.
 - `#[cfg(test)]` modules in `src/` keep only what needs private access (rmcp's macro makes the tool
-  fns private; the breaker internals are reachable only from inside `db.rs`).
+  fns private; the breaker internals, the shared schema cell, the per-dialect SQL and the SQLite URL
+  parsing are reachable only from inside `db.rs`).
 
 Rules for the suite:
 
-- `cargo test` must pass on a bare checkout with **no PostgreSQL running**. Point at a dead port
-  (`postgres://mcp:mcp@127.0.0.1:1/mcp`) via `Store::connect_with_timeout(url, FAST)` and assert
-  bounded failure. Live-database behaviour (inserts, `DELETE` row counts, migration
-  `VersionMismatch`) is verified manually against the devcontainer instead.
+- `cargo test` must pass on a bare checkout with **no database running**. Point at a dead port
+  (`postgres://…127.0.0.1:1/mcp`) via `Store::connect_with_timeout(url, FAST)` and assert bounded
+  failure. Only the MySQL- and PostgreSQL-specific behaviour (migration `VersionMismatch`, TLS,
+  recovering after the 30 s breaker cooldown) is verified manually against the devcontainer, with
+  `scripts/verify-backend.sh`.
+- A test that wants to see a row must **poll** for it: writes are fire-and-forget, so
+  `wait_for_history` in `tests/sqlite_backend.rs` is the sanctioned way to observe one. Do not make
+  the insert path awaitable just to make a test simpler.
 - Anything spawning the server must set `env!("CARGO_BIN_EXE_poc-rust-mcp")`, `env_remove`
   `DATABASE_URL` so an ambient value cannot change what is under test, and `kill_on_drop(true)`.
 - Read each JSON-RPC response **before** closing stdin; rmcp 0.1.5 drops in-flight responses at EOF.

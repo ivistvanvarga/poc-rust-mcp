@@ -718,167 +718,91 @@ impl Store {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Private access for the relocated unit tests in `tests/db.rs`.
+///
+/// A child module can already read its parent's private items, so nothing here needs to widen
+/// visibility: these are thin shims over internals that stay `fn`, not `pub fn`. `#[doc(hidden)]`
+/// keeps them out of the rendered API. This exists so that *every* test lives in `tests/` — see
+/// `AGENTS.md`.
+#[doc(hidden)]
+pub mod testing {
+    use super::{
+        Dialect, Migrator, POSTGRES_MIGRATIONS, Store, sqlite_is_in_memory as parse_in_memory,
+        sqlite_param as parse_param, sqlite_url_parts as parse_url_parts,
+    };
 
-    // Only behaviour that needs private access lives here; the public `Store` surface is covered
-    // by tests/store_offline.rs, the protocol by tests/stdio_protocol.rs, and a real round-trip
-    // against SQLite by tests/sqlite_backend.rs.
-
-    #[tokio::test]
-    async fn clones_share_one_schema_cell() {
-        // `tokio::sync::OnceCell` clones to a fresh, *empty* cell when it has no value yet, and
-        // every history write hands a clone to a spawned task before any migration has run. With a
-        // per-store cell that task migrates on its own, racing the caller's migration: harmless
-        // behind PostgreSQL's advisory lock, a UNIQUE violation on `_sqlx_migrations.version` on
-        // SQLite, which has no migration lock at all.
-        let store = Store::connect("sqlite::memory:");
-        // Cloned first, exactly as `record_success` does.
-        let detached = store.clone();
-        store.schema.get_or_init(|| async {}).await;
-
-        assert!(
-            detached.schema.initialized(),
-            "a clone taken before the first migration must see that migration"
-        );
+    /// Count a failure as the breaker sees it, without needing a real database.
+    pub fn note_failure(store: &Store, error: &sqlx::Error) {
+        store.note_failure(error);
     }
 
-    #[test]
-    fn successful_call_resets_the_breaker() {
-        let store = Store::disabled();
-        store.note_failure(&sqlx::Error::PoolClosed);
-        store.note_failure(&sqlx::Error::PoolClosed);
-        assert_eq!(store.breaker.lock().unwrap().failures, 2);
-        assert!(store.check_breaker().is_err(), "breaker should be open");
-
+    /// Reset the breaker as a successful round-trip would.
+    pub fn note_reachable(store: &Store) {
         store.note_reachable();
-        let breaker = store.breaker.lock().unwrap();
-        assert_eq!(breaker.failures, 0);
-        assert!(breaker.retry_after.is_none());
     }
 
-    #[test]
-    fn breaker_does_not_trip_on_query_level_errors() {
-        // A bad query must not be able to disable storage.
-        let store = Store::disabled();
-        store.note_failure(&sqlx::Error::RowNotFound);
-        assert_eq!(store.breaker.lock().unwrap().failures, 0);
+    /// Whether the breaker would currently reject a call.
+    pub fn breaker_is_open(store: &Store) -> bool {
+        store.check_breaker().is_err()
     }
 
-    #[test]
-    fn url_scheme_selects_the_backend() {
-        assert_eq!(
-            Dialect::from_url("postgres://mcp:mcp@db:5432/mcp"),
-            Ok(Dialect::Postgres)
-        );
-        assert_eq!(
-            Dialect::from_url("postgresql://mcp:mcp@db/mcp"),
-            Ok(Dialect::Postgres)
-        );
-        assert_eq!(
-            Dialect::from_url("mysql://mcp:mcp@db:3306/mcp"),
-            Ok(Dialect::MySql)
-        );
-        assert_eq!(
-            Dialect::from_url("mariadb://mcp:mcp@db/mcp"),
-            Ok(Dialect::MySql)
-        );
-        assert_eq!(Dialect::from_url("sqlite://mcp.db"), Ok(Dialect::Sqlite));
-        assert_eq!(Dialect::from_url("SQLITE::memory:"), Ok(Dialect::Sqlite));
+    /// Consecutive connectivity failures recorded so far.
+    pub fn failure_count(store: &Store) -> u32 {
+        store
+            .breaker
+            .lock()
+            .expect("breaker mutex poisoned")
+            .failures
     }
 
-    #[test]
-    fn a_url_without_a_supported_scheme_is_rejected_by_name() {
-        // The message has to name the alternatives, otherwise a typo looks like "storage off".
-        let no_scheme = Dialect::from_url("mcp.db").unwrap_err();
-        assert!(no_scheme.contains("sqlite"), "{no_scheme}");
-
-        let typo = Dialect::from_url("postgresqls://db/mcp").unwrap_err();
-        assert!(typo.contains("postgresqls"), "{typo}");
-        for scheme in Dialect::SCHEMES {
-            assert!(typo.contains(scheme), "{typo} should list {scheme}");
-        }
+    /// Pretend migrations have already run, so a clone's view of the cell can be inspected.
+    pub async fn mark_schema_initialised(store: &Store) {
+        store.schema.get_or_init(|| async {}).await;
     }
 
-    #[test]
-    fn each_backend_gets_its_own_placeholder_spelling() {
-        assert_eq!(
-            Dialect::Postgres.insert_sql(),
-            "INSERT INTO calc_history (operation, inputs, result, error, created_at) \
-             VALUES ($1, $2, $3, $4, $5)"
-        );
-        assert_eq!(
-            Dialect::MySql.insert_sql(),
-            "INSERT INTO calc_history (operation, inputs, result, error, created_at) \
-             VALUES (?, ?, ?, ?, ?)"
-        );
-        assert_eq!(
-            Dialect::Sqlite.list_sql(),
-            Dialect::MySql.list_sql(),
-            "MySQL and SQLite share the '?' placeholder style"
-        );
-        assert!(Dialect::Postgres.list_sql().contains("LIMIT $1"));
+    /// Whether *this* store's view of the schema cell is set — the thing that must survive a clone.
+    pub fn schema_initialised(store: &Store) -> bool {
+        store.schema.initialized()
     }
 
-    #[test]
-    fn each_backend_has_its_own_migration_set() {
-        // Each set is embedded from its own directory, so they cannot silently drift into one
-        // shared file. Version 1 must exist in all three or a backend would migrate to nothing.
-        for dialect in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
-            let migrator = dialect.migrations();
-            assert_eq!(
-                migrator.iter().map(|m| m.version).collect::<Vec<_>>(),
-                [1],
-                "{} should have exactly migration 1",
-                dialect.label()
-            );
-        }
-        // The PostgreSQL file is unchanged from when it was the only migration, so databases that
-        // already applied it keep matching its checksum instead of failing with VersionMismatch.
-        assert_eq!(
-            POSTGRES_MIGRATIONS.iter().next().map(|m| &*m.sql),
-            Some(include_str!("../migrations/postgres/0001_calc_history.sql")),
-        );
+    /// The `INSERT` a backend would send, placeholders included.
+    pub fn insert_sql(dialect: Dialect) -> String {
+        dialect.insert_sql()
     }
 
-    #[test]
-    fn sqlite_urls_are_split_like_sqlx_splits_them() {
-        assert_eq!(sqlite_url_parts("sqlite::memory:"), (":memory:", None));
-        assert_eq!(sqlite_url_parts("sqlite://mcp.db"), ("mcp.db", None));
-        assert_eq!(
-            sqlite_url_parts("sqlite:///var/lib/mcp.db"),
-            ("/var/lib/mcp.db", None)
-        );
-        assert_eq!(
-            sqlite_url_parts("sqlite://mcp.db?mode=ro"),
-            ("mcp.db", Some("mode=ro"))
-        );
+    /// The `SELECT` a backend would send, placeholders included.
+    pub fn list_sql(dialect: Dialect) -> String {
+        dialect.list_sql()
     }
 
-    #[test]
-    fn sqlite_query_parameters_are_read_without_percent_decoding() {
-        let params = Some("mode=rwc&cache=shared");
-        assert_eq!(sqlite_param(params, "mode"), Some("rwc"));
-        assert_eq!(sqlite_param(params, "cache"), Some("shared"));
-        assert_eq!(sqlite_param(params, "immutable"), None);
-        assert_eq!(sqlite_param(None, "mode"), None);
+    /// The migrations a backend would apply.
+    pub fn migrations(dialect: Dialect) -> &'static Migrator {
+        dialect.migrations()
     }
 
-    #[test]
-    fn in_memory_sqlite_is_recognised_in_both_spellings() {
-        assert!(sqlite_is_in_memory(":memory:", None));
-        assert!(sqlite_is_in_memory("", Some("mode=memory")));
-        assert!(!sqlite_is_in_memory("mcp.db", Some("mode=rwc")));
+    /// The SQL of the PostgreSQL migration that has already shipped, for checksum pinning.
+    ///
+    /// Owned rather than borrowed because a migration body is a `Cow` and the test only needs to
+    /// compare it with the file on disk.
+    pub fn postgres_migration_sql() -> Option<String> {
+        POSTGRES_MIGRATIONS
+            .iter()
+            .next()
+            .map(|migration| migration.sql.to_string())
     }
 
-    #[test]
-    fn a_read_only_sqlite_url_is_not_created_behind_the_users_back() {
-        // `mode=ro`/`mode=rw` are the URL's way of saying the file must already exist, so the pool
-        // must not add CREATE to the open flags for them.
-        assert!(matches!(
-            sqlite_param(Some("mode=ro"), "mode"),
-            Some("ro" | "rw")
-        ));
+    /// See the private `sqlite_url_parts`, which this mirrors.
+    pub fn sqlite_url_parts(url: &str) -> (&str, Option<&str>) {
+        parse_url_parts(url)
+    }
+
+    /// See the private `sqlite_param`, which this mirrors.
+    pub fn sqlite_param<'a>(params: Option<&'a str>, key: &str) -> Option<&'a str> {
+        parse_param(params, key)
+    }
+
+    /// See the private `sqlite_is_in_memory`, which this mirrors.
+    pub fn sqlite_is_in_memory(database: &str, params: Option<&str>) -> bool {
+        parse_in_memory(database, params)
     }
 }

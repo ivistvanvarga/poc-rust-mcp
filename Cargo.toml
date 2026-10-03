@@ -2,6 +2,10 @@
 name = "poc-rust-mcp"
 version = "0.1.0"
 edition = "2024"
+# The full text is in LICENSE. Keep the SPDX identifier here and the header in LICENSE in step:
+# `cargo` warns if a crate declares a license it has no `LICENSE` file for, and vice versa.
+license = "BSD-2-Clause"
+authors = ["iv.istvan.varga"]
 
 [dependencies]
 rmcp = { version = "0.1", features = [
@@ -27,3 +31,8 @@ sqlx = { version = "0.8", default-features = false, features = [
 ] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 toml = "1.1.6"
+
+[dev-dependencies]
+# Only to build a `RequestContext` in unit tests: rmcp hands every handler a
+# `CancellationToken`, and these tests call handlers directly instead of over a transport.
+tokio-util = "0.7"

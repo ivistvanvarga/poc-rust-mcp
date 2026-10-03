@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use poc_rust_mcp::{
-    config::{Cli, Config, SystemEnv},
+    config::{Cli, Config, ServerConfig, SystemEnv},
     db::{Dialect, Store},
     server::Calculator,
 };
@@ -35,9 +35,9 @@ async fn run() -> Result<()> {
 
     let store = Store::from_settings(&config.storage);
     if cli.serve_sse {
-        serve_sse(config.server.sse_address, store).await
+        serve_sse(&config.server, store).await
     } else {
-        serve_stdio(store).await
+        serve_stdio(&config.server, store).await
     }
 }
 
@@ -59,9 +59,9 @@ fn init_tracing(log_filter: &str) {
         .init();
 }
 
-async fn serve_stdio(store: Store) -> Result<()> {
+async fn serve_stdio(server: &ServerConfig, store: Store) -> Result<()> {
     let storage = store.dialect().map_or("disabled", Dialect::label);
-    let service = Calculator::new(store)
+    let service = calculator(server, store)
         .serve(stdio())
         .await
         .context("failed to serve over stdio")?;
@@ -73,12 +73,16 @@ async fn serve_stdio(store: Store) -> Result<()> {
     Ok(())
 }
 
-async fn serve_sse(addr: std::net::SocketAddr, store: Store) -> Result<()> {
+async fn serve_sse(server: &ServerConfig, store: Store) -> Result<()> {
+    let addr = server.sse_address;
     let storage = store.dialect().map_or("disabled", Dialect::label);
+    let page_size = server.list_page_size;
     let cancel = SseServer::serve(addr)
         .await
         .with_context(|| format!("failed to bind SSE server to {addr}"))?
-        .with_service(move || Calculator::new(store.clone()));
+        // A fresh `Calculator` per session, so each client's subscriptions and log level stay its
+        // own: rmcp installs that session's peer on it.
+        .with_service(move || Calculator::with_list_page_size(store.clone(), page_size));
     tracing::info!(%addr, storage, sse_path = "/sse", post_path = "/message", "sse server ready");
 
     tokio::signal::ctrl_c()
@@ -87,4 +91,9 @@ async fn serve_sse(addr: std::net::SocketAddr, store: Store) -> Result<()> {
     tracing::info!("shutting down");
     cancel.cancel();
     Ok(())
+}
+
+/// The one place a [`Calculator`] is built, so the page size is never forgotten on one transport.
+fn calculator(server: &ServerConfig, store: Store) -> Calculator {
+    Calculator::with_list_page_size(store, server.list_page_size)
 }

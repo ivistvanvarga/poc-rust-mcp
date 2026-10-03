@@ -11,7 +11,7 @@
 //! bare `cargo run` working. Nothing is discovered implicitly: an absent file is simply an absent
 //! layer, so behaviour never depends on a file that happens to lie in the working directory.
 //!
-//! The file is deserialized into a sparse mirror ([`FileConfig`]) where every field is optional, and
+//! The file is deserialized into a sparse mirror (`FileConfig`) where every field is optional, and
 //! only fields actually present in the file overwrite what came before. Unknown keys are rejected
 //! rather than ignored, so a typo is reported at startup instead of silently doing nothing.
 
@@ -45,6 +45,8 @@ pub mod env_keys {
     pub const SSE_ADDRESS: &str = "MCP_SSE_ADDRESS";
     /// `tracing` filter.
     pub const LOG_FILTER: &str = "RUST_LOG";
+    /// Rows per page for the MCP `*/list` methods.
+    pub const LIST_PAGE_SIZE: &str = "MCP_LIST_PAGE_SIZE";
     /// Maximum pooled connections.
     pub const STORAGE_MAX_CONNECTIONS: &str = "MCP_STORAGE_MAX_CONNECTIONS";
     /// Connection-acquire budget, in milliseconds.
@@ -71,6 +73,12 @@ pub struct ServerConfig {
     pub sse_address: SocketAddr,
     /// `tracing` filter directive.
     pub log_filter: String,
+    /// Rows per page for the MCP `*/list` methods.
+    ///
+    /// Every catalogue here is small, so this only matters to a client that pages deliberately —
+    /// or to a test, which sets it low to walk a cursor. It exists because pagination that cannot
+    /// be exercised is pagination that rots.
+    pub list_page_size: usize,
 }
 
 /// Calculation-history settings. `url: None` means storage is disabled.
@@ -108,6 +116,7 @@ impl Default for ServerConfig {
             sse_address: SocketAddr::from_str(DEFAULT_SSE_ADDRESS)
                 .expect("the built-in default SSE address is a valid socket address"),
             log_filter: DEFAULT_LOG_FILTER.to_owned(),
+            list_page_size: crate::server::DEFAULT_LIST_PAGE_SIZE,
         }
     }
 }
@@ -275,11 +284,22 @@ Database:
   TLS follows the URL and the driver's own default; add ?sslmode=require (PostgreSQL)
   or ?ssl-mode=REQUIRED (MySQL) if the server demands it.
 
+MCP features:
+  tools       add, sub, mul, div, db_status, calc_history, clear_calc_history
+  prompts     review_calculation_history, check_storage_health
+  resources   calc://history, calc://history/{id}, calc://history/operation/{operation}
+              subscribe with resources/subscribe to be told when history changes
+  logging     logging/setLevel filters the per-calculation notifications/message
+  completion  argument values for prompts and resource templates
+  All */list methods are paginated (server.list_page_size).
+
 Environment:
   DATABASE_URL   database URL for calculation history, e.g.
                  postgres://mcp:mcp@127.0.0.1:5432/mcp
                  Unset or unreachable = storage disabled, calculator tools still work
   RUST_LOG       Log filter, e.g. RUST_LOG=debug (logs go to stderr)
+  MCP_LIST_PAGE_SIZE
+                 Rows per page for the MCP */list methods (default 20)
 
 See config.example.toml for every file setting.
 "
@@ -347,6 +367,9 @@ impl Config {
         if let Some(filter) = non_blank(env.get(env_keys::LOG_FILTER)) {
             config.server.log_filter = filter;
         }
+        if let Some(value) = non_blank(env.get(env_keys::LIST_PAGE_SIZE)) {
+            config.server.list_page_size = parse_number(env_keys::LIST_PAGE_SIZE, &value)?;
+        }
         if let Some(value) = non_blank(env.get(env_keys::STORAGE_MAX_CONNECTIONS)) {
             config.storage.max_connections =
                 parse_number(env_keys::STORAGE_MAX_CONNECTIONS, &value)?;
@@ -395,6 +418,9 @@ impl Config {
         }
         if let Some(filter) = file.server.log_filter {
             self.server.log_filter = filter;
+        }
+        if let Some(value) = file.server.list_page_size {
+            self.server.list_page_size = value;
         }
 
         if let Some(url) = file.storage.url {
@@ -457,6 +483,14 @@ impl Config {
                 reason: "must be at least 1".to_owned(),
             });
         }
+        if self.server.list_page_size == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "server.list_page_size".to_owned(),
+                value: "0".to_owned(),
+                reason: "must be at least 1; 0 would return an empty page and never advance"
+                    .to_owned(),
+            });
+        }
         // Surface a bad filter now instead of letting `tracing_subscriber` quietly fall back.
         EnvFilter::try_new(&self.server.log_filter).map_err(|error| ConfigError::InvalidValue {
             key: "server.log_filter".to_owned(),
@@ -504,6 +538,7 @@ struct FileConfig {
 struct FileServer {
     sse_address: Option<String>,
     log_filter: Option<String>,
+    list_page_size: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -19,6 +19,13 @@
 # `tracing` filter directive. Overridden by RUST_LOG. Default: "info"
 # log_filter = "info"
 
+# Rows per page for the MCP `*/list` methods (tools, prompts, resources and their templates).
+# Every catalogue here is small, so this only matters to a client that pages deliberately — but it
+# is configurable because pagination that cannot be exercised is pagination that rots. Must be at
+# least 1; 0 would return an empty page and never advance. Overridden by MCP_LIST_PAGE_SIZE.
+# Default: 20
+# list_page_size = 20
+
 [storage]
 # Database URL. Leave unset (or blank) to disable storage: the server still starts and every
 # arithmetic tool still works, while the three history tools report that storage is off.

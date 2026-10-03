@@ -10,6 +10,8 @@ backend; nothing else is configured.
 The point of the PoC is the storage story: the calculator tools must answer instantly whether or not
 a database exists, is reachable, or is misconfigured. Storage degrades; it never blocks.
 
+## Tools
+
 | Tool | Arguments | Returns |
 | --- | --- | --- |
 | `add` | `a: i32`, `b: i32` | `"2 + 40 = 42"` |
@@ -19,6 +21,11 @@ a database exists, is reachable, or is misconfigured. Storage degrades; it never
 | `db_status` | — | `"mysql database reachable, 128 stored calculations"` |
 | `calc_history` | `limit: i64` (clamped to `1..=storage.max_history_rows`) | one line per entry, most recent first |
 | `clear_calc_history` | — | `"deleted 128 recorded calculations"` |
+
+## Everything else MCP offers
+
+The server implements every server-side feature rmcp 0.1.5 exposes, and advertises exactly those —
+see [MCP features](#mcp-features) for the full map and for what the pinned SDK cannot do.
 
 ## Requirements
 
@@ -113,6 +120,7 @@ duration type.
 | — | `--config <PATH>` | `MCP_CONFIG` | none | TOML config file to load |
 | `server.sse_address` | `--sse [ADDR]` | `MCP_SSE_ADDRESS` | `127.0.0.1:8000` | Bind address for the SSE transport |
 | `server.log_filter` | — | `RUST_LOG` | `info` | `tracing` filter; logs always go to **stderr** |
+| `server.list_page_size` | — | `MCP_LIST_PAGE_SIZE` | `20` | Rows per page for the MCP `*/list` methods |
 | `storage.url` | `--db-url <URL>` | `DATABASE_URL` | unset | Database URL; the scheme picks the backend. Unset, blank, unparsable or unsupported ⇒ storage disabled |
 | `storage.max_connections` | — | `MCP_STORAGE_MAX_CONNECTIONS` | `5` | Pool size |
 | `storage.acquire_timeout_ms` | — | `MCP_STORAGE_ACQUIRE_TIMEOUT_MS` | `3000` | How long an operation may wait for a connection |
@@ -209,6 +217,90 @@ container:
 ./scripts/verify-backend.sh 'mysql://mcp:mcp@127.0.0.1:3306/mcp'
 ```
 
+## MCP features
+
+rmcp 0.1.5 exposes one `ServerHandler` hook per MCP server-side feature, and all of them are
+implemented. `initialize` advertises exactly this set — nothing more:
+
+```json
+{"tools": {}, "prompts": {}, "resources": {"subscribe": true}, "logging": {}}
+```
+
+| Feature | Method(s) | Behaviour |
+| --- | --- | --- |
+| Tools | `tools/list`, `tools/call` | The seven above, listed sorted, paginated |
+| Prompts | `prompts/list`, `prompts/get` | Two prompts; arguments validated, not just described |
+| Resources | `resources/list`, `resources/templates/list`, `resources/read` | History as a readable document |
+| Subscription | `resources/subscribe`, `resources/unsubscribe`, `notifications/resources/updated` | Announced on every write, per affected resource |
+| Logging | `logging/setLevel`, `notifications/message` | An `Info` line per recorded calculation, filtered by the level |
+| Completion | `completion/complete` | Prompt arguments and resource-template placeholders |
+| Ping | `ping` | Answered |
+| Pagination | `params.cursor` on all four `*/list` | Opaque index cursors |
+| Progress / cancellation | `notifications/progress`, `notifications/cancelled` | Accepted; see below |
+
+### Prompts
+
+A prompt runs nothing: `prompts/get` returns messages the client hands to a model, which then decides
+which tools to call. Both prompts point the model at a tool or resource rather than encoding answers.
+
+| Name | Arguments | Asks the model to |
+| --- | --- | --- |
+| `review_calculation_history` | `operation` (optional) | read `calc://history` and summarise it, optionally narrowed to one operation |
+| `check_storage_health` | — | call `db_status` and explain any degradation |
+
+Validation is strict, because a silently ignored argument would change a prompt's meaning without
+telling anyone: an unknown prompt, a misspelled argument, or an `operation` outside
+`add`/`sub`/`mul`/`div` is an `invalid_params` error naming what is accepted.
+
+### Resources
+
+```text
+calc://history                       every recorded calculation, newest first  (listed)
+calc://history/{id}                  one recorded calculation                   (template)
+calc://history/operation/{operation} every recorded calculation of one operation (template)
+```
+
+The per-id and per-operation URIs are **templates**, not enumerated resources: the set of ids is
+unbounded and changes with every call, so listing them would be a lie a client could cache.
+
+Reads degrade exactly like the tools. A disabled or unreachable database is **not** a missing
+resource — the resource resolves and its *content* explains why it is empty. Only a URI this server
+does not serve, or an id with no row behind it, is `resource_not_found` (`-32002`).
+
+### Subscription and logging
+
+`resources/subscribe` is refused for a URI this server does not serve, rather than accepted into a
+subscription that could never fire. A write then announces every subscribed resource it invalidates —
+the whole log, and that operation's slice — but never a single row, which does not change once
+written. Announcements are sent from a detached task and describe the *attempt* to record, because
+the write is fire-and-forget by design; the notification is advisory, so over-announcing is harmless
+where a client left waiting is not.
+
+`logging/setLevel` sets a floor. Each recorded calculation emits one `Info` `notifications/message`;
+below the floor nothing is sent. The default floor is `Info`, so announcements work without any setup.
+
+### Progress and cancellation
+
+Both notifications are accepted and deliberately do nothing. rmcp already cancels the request's
+`CancellationToken` when `notifications/cancelled` arrives, before the handler hook runs, so the
+transport half is automatic; and every tool is a single atomic call returning its whole result at
+once, so there is no partial work to abandon and nothing to report progress *for*. The tests assert
+the server neither replies to nor breaks on such notifications.
+
+### What the pinned SDK cannot do
+
+`rmcp` 0.1 implements MCP 2024-11-05 only, so these are unavailable rather than unimplemented, and no
+capability is advertised for them: **tool annotations** (`readOnlyHint`, `destructiveHint`, …),
+**structured tool output** (`outputSchema`/`structuredContent`), **icons**, and resource links in tool
+results — all of which arrived in 2025-03-26 and 2025-06-18.
+
+One SDK bug is worked around rather than fixed: rmcp serialises `ResourceContents` with an
+enum-level `rename_all`, which renames the variants but not the fields inside them, so a `mimeType`
+set on a read result goes on the wire as `mime_type` — not a key in the MCP schema. The server
+therefore *omits* the optional media type on reads instead of emitting it wrongly; `resources/list`
+still carries a correct `mimeType`, because that one comes from a struct whose `rename_all` applies.
+`tests/mcp_features.rs` pins this, so an rmcp upgrade will flag it.
+
 ## How storage behaves
 
 Everything here is configurable (see [Configuration](#configuration)); with no configuration at all,
@@ -269,11 +361,30 @@ Tests are hermetic: `cargo test` passes on a bare checkout with **no database ru
 
 | Layer | File | What it proves |
 | --- | --- | --- |
-| Protocol | `tests/stdio_protocol.rs` | Spawns the real binary and speaks raw JSON-RPC: capabilities, `tools/list`, argument validation, tool errors vs JSON-RPC errors, stdout purity, and that arithmetic does not block on a dead database. |
+| Protocol | `tests/stdio_protocol.rs` | Spawns the real binary and speaks raw JSON-RPC: capabilities (and the ones deliberately *not* advertised), `ping`, `tools/list`, argument validation, tool errors vs JSON-RPC errors, stdout purity, that arithmetic does not block on a dead database, and that progress/cancellation notifications leave the server working. |
+| MCP features | `tests/mcp_features.rs` | Every feature beyond tools, reachable through the protocol: prompt catalogue and validation, resource routing and degradation, subscription announcements, the logging level filter, completion, and a full cursor walk over all four paginated methods. |
+| Handlers | `tests/server.rs` | The `Calculator` and its `ServerHandler` hooks called directly — tools via the public `call_tool` (rmcp keeps them private), capabilities, pagination, subscribe/unsubscribe, completion, and the log-level filter. |
+| Catalogue | `tests/prompts.rs`, `tests/resources.rs` | The prompt and resource catalogues as pure functions: rendering, argument validation, URI routing, and reads against an in-memory SQLite store. |
+| Internals | `tests/db.rs` | The handful of behaviours no public API can reach — the circuit breaker's bookkeeping, the shared schema cell, the per-dialect SQL and migration sets, and SQLite URL parsing — through the `#[doc(hidden)] db::testing` module. |
 | Public API | `tests/store_offline.rs` | The `Store`/`HistoryEntry` surface without a database: scheme→backend selection, disabled storage, unparsable and unsupported URLs, bounded failure, breaker tripping, fire-and-forget writes. |
 | Real backend | `tests/sqlite_backend.rs` | A full round trip against SQLite, which is embedded and needs no server: migrations apply, a JSON and a timestamp column survive a write/read, history is newest-first and limited, `clear` reports a real row count, a file-backed database persists across stores. |
 | Configuration | `tests/config.rs` | Layer precedence, defaults, blank-value handling, rejected keys and out-of-range values, CLI parsing, and that resolved settings and the resolved URL's backend reach the `Store`. |
-| Private | `src/**/mod tests` | Only what needs private access — `rmcp`'s macro makes tool functions private, and the schema cell, the dialect's SQL spelling and the SQLite URL parsing are private. |
+
+Every test lives in `tests/`; there is no `#[cfg(test)]` module left in `src/`. `tests/db.rs` and
+`tests/server.rs` reach a few private items through `db::testing` and `server::testing` —
+`#[doc(hidden)] pub mod` shims that wrap internals still declared `fn`, so the rendered API is
+unchanged. rmcp's macro keeps the tool functions private and `server::testing` deliberately does not
+widen that, so `tests/server.rs` calls tools the way a client does.
+
+`tests/support/mod.rs` holds the JSON-RPC harness the two protocol-level files share, plus a
+`request_context()` helper for calling handlers directly. One part is worth knowing about:
+**notifications are buffered, not skipped.** The server pushes `notifications/message` and
+`notifications/resources/updated` from detached tasks, so either can land before the response that
+caused it — a reader that skipped it would lose it. `Server::quiesce` then drives harmless round-trips
+until the server stops pushing, because no single notification's arrival can prove the stream is
+drained: several writes announce from separate tasks and may interleave, and a whole batch can still
+be unscheduled. A test that needs a page size other than the default sets `MCP_LIST_PAGE_SIZE`;
+pagination is otherwise unreachable, since every catalogue fits on one page.
 
 Anything that needs a live PostgreSQL or MySQL is verified manually against the devcontainer with
 `scripts/verify-backend.sh`, rather than in `cargo test`. That includes migration `VersionMismatch`
@@ -282,15 +393,18 @@ and recovering after the 30 s breaker cooldown.
 ### Layout
 
 ```
-src/lib.rs                     library target: exposes config + db + server
+src/lib.rs                     library target: exposes config + db + prompts + resources + server
 src/config.rs                  layered configuration (defaults/file/env/flags)
 src/main.rs                    CLI, tracing, stdio/SSE wiring
-src/server.rs                  Calculator server, tool definitions, ServerInfo
+src/server.rs                  Calculator: ServerHandler, peer/subscriptions, page size
+src/prompts.rs                 the prompt catalogue, rendering and validation
+src/resources.rs               resource catalogue, URI routing, reads from the store
 src/db.rs                      all database access, dialects, migrations, circuit breaker
 migrations/{postgres,mysql,sqlite}/  per-dialect sqlx migrations
 config.example.toml            documented example config (copy to config.toml)
 scripts/verify-backend.sh      manual end-to-end check against a live database
-tests/                         integration tests
+tests/                         every test in the crate, one file per layer
+tests/support/mod.rs           JSON-RPC harness shared by the protocol-level test files
 .devcontainer/                 podman-compose stack (app + postgres + mysql)
 AGENTS.md                      notes and gotchas for coding agents
 ```
@@ -314,12 +428,18 @@ let calculator = Calculator::new(Store::from_settings(&config.storage));
 - Arithmetic uses wrapping semantics for `i32`, so `add`/`sub`/`mul` wrap on overflow rather than
   returning an error.
 - Fire-and-forget writes can lose the last row if the process exits immediately after a tool returns.
-- `rmcp` is pinned to `0.1`, whose API differs substantially from 3.x — see `AGENTS.md`.
-- `ToolBox::list()` is backed by a `HashMap`, so tool order is not deterministic (`tool_names()`
-  sorts).
+- `rmcp` is pinned to `0.1`, whose API differs substantially from 3.x — see `AGENTS.md`. Tool
+  annotations, structured tool output and icons are unavailable on this pin.
+- `ToolBox::list()` is backed by a `HashMap`, so `tools/list` is sorted by the server rather than
+  reported in map order; the prompt and resource catalogues keep their declaration order.
 - There is no config-file discovery: a file is only read when `--config` or `MCP_CONFIG` names it.
   Longest-prefix or per-directory search would be the next step if this becomes annoying.
 - SQL Server is not supported. sqlx itself only implements PostgreSQL, MySQL and SQLite; MSSQL needs
   the third-party `sqlx-mssql` crate.
 - SQLite file databases stay in the rollback-journal mode SQLite defaults to. A history log written by
   several processes at once would want WAL, which the URL cannot currently request.
+
+## License
+
+BSD 2-Clause. The full text is in [`LICENSE`](LICENSE); `Cargo.toml` declares the SPDX identifier
+`BSD-2-Clause`, and the two must stay in step.

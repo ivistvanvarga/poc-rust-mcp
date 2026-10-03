@@ -422,11 +422,19 @@ fn usage_documents_the_layers_and_the_config_file() {
         "--sse",
         env_keys::CONFIG,
         env_keys::DATABASE_URL,
+        env_keys::LIST_PAGE_SIZE,
         "config.example.toml",
         // The backend is chosen by URL scheme, so the help text has to list them.
         "postgres://",
         "mysql://",
         "sqlite://",
+        // And `--help` is where a user discovers what the server can do, so each feature is named.
+        "tools",
+        "prompts",
+        "resources",
+        "logging",
+        "completion",
+        "list_page_size",
     ] {
         assert!(
             usage.contains(expected),
@@ -457,6 +465,48 @@ async fn resolved_storage_settings_reach_the_store() {
     // A configured cap is honoured when clamping what a client may ask for.
     assert_eq!(clamp_history_limit(1_000_000, store.max_history_rows()), 5);
     assert_eq!(clamp_history_limit(0, store.max_history_rows()), 1);
+}
+
+#[test]
+fn the_list_page_size_comes_from_the_environment_and_the_file() {
+    // It only matters to a client that pages deliberately, but it must be settable for the pagination
+    // tests to reach a cursor at all.
+    let from_env = resolve(
+        &no_cli(),
+        &MapEnv::new().with(env_keys::LIST_PAGE_SIZE, "2"),
+    )
+    .expect("numeric environment should resolve");
+    assert_eq!(from_env.server.list_page_size, 2);
+
+    let file = TempFile::new("[server]\nlist_page_size = 5\n");
+    let from_file = resolve(
+        &cli(&["--config", file.path().to_str().expect("utf-8 path")]),
+        &no_env(),
+    )
+    .expect("valid config should resolve");
+    assert_eq!(from_file.server.list_page_size, 5);
+    assert!(
+        from_file.server.log_filter == "info",
+        "a partial [server] section must not disturb its siblings"
+    );
+}
+
+#[test]
+fn a_zero_page_size_is_rejected() {
+    // A page size of zero returns an empty page and never advances, so a plain cursor loop would
+    // hang rather than fail: it has to be caught at startup.
+    let file = TempFile::new("[server]\nlist_page_size = 0\n");
+    let error = resolve(
+        &cli(&["--config", file.path().to_str().expect("utf-8 path")]),
+        &no_env(),
+    )
+    .expect_err("a zero page size must be rejected");
+
+    match &error {
+        ConfigError::InvalidValue { key, .. } => assert_eq!(key, "server.list_page_size"),
+        other => panic!("wrong error: {other:?}"),
+    }
+    assert!(error.to_string().contains("never advance"), "{error}");
 }
 
 #[tokio::test]

@@ -4,13 +4,100 @@
 
 Crate `poc-rust-mcp` (edition 2024) with **both** a lib and a bin target:
 
-- `src/lib.rs` — exposes `pub mod config`, `pub mod db` and `pub mod server` so integration tests
-  can `use poc_rust_mcp::…`.
+- `src/lib.rs` — exposes `pub mod config`, `db`, `prompts`, `resources` and `server`, so every test in
+  `tests/` can drive the server's public surface directly.
 - `src/main.rs` — thin transport wiring (tracing, stdio/SSE), imports the lib rather than declaring
   `mod` items itself; all argument parsing lives in `config`.
-- `src/config.rs` — layered configuration, `src/server.rs` — the `Calculator` server and all tools,
+- `src/config.rs` — layered configuration, `src/server.rs` — the `Calculator`: tools, `ServerHandler`,
+  peer/subscriptions/log level/page size. `src/prompts.rs` — the prompt catalogue.
+  `src/resources.rs` — resource catalogue, URI routing, reads from the store.
   `src/db.rs` — all database access, `migrations/{postgres,mysql,sqlite}/` — per-dialect sqlx
   migrations, `config.example.toml` — the documented example (copy to the git-ignored `config.toml`).
+
+## The `ServerHandler` impl block is NOT annotated `#[tool(tool_box)]`
+
+Everything else in this file follows from this, so read it before touching `src/server.rs`.
+
+`#[tool(tool_box)]` on an `impl ServerHandler` block **unconditionally generates `list_tools` and
+`call_tool`**. It does not check whether they already exist, so hand-writing them alongside it is a
+duplicate-definition error. The inherent `impl Calculator` block keeps the annotation (that is what
+builds the static `tool_box()`), and the handler block does not:
+
+```rust
+#[tool(tool_box)]
+impl Calculator { /* tools; generates fn tool_box() */ }
+
+impl ServerHandler for Calculator {
+    async fn list_tools(&self, params, context) -> … { /* written out: sorts + paginates */ }
+    async fn call_tool(&self, request, context) -> … { /* written out: the macro's body */ }
+}
+```
+
+Both are written out because `list_tools` needs two things the generated one cannot do: sort the
+`HashMap`-backed tool box so clients see a stable order, and paginate. `call_tool` is exactly the
+macro's body, restated so the pair stays visibly together — **if this ever compiles without a
+`list_tools`, every tool is silently invisible.** Keep them adjacent and keep them both.
+
+## Server capabilities: advertise only what is implemented
+
+`get_info` enables `tools`, `prompts`, `resources`, `resources_subscribe` and `logging`, and nothing
+else. `ServerCapabilities::builder()` will happily build flags for features this crate does not have,
+so the list is a claim, and a false one costs a client a feature that then answers `method_not_found`:
+
+- **No `*ListChanged`.** The tool, prompt and resource catalogues are all static. Advertising
+  `listChanged` would make clients poll for a change that cannot happen.
+- **No `sampling`, `roots` or `elicitation`.** Those are *client* capabilities.
+- **Completions have no capability flag at all** in the spec, so there is nothing to set.
+
+`tests/stdio_protocol.rs` asserts both directions: each expected key is present, and
+`tools.listChanged` is absent.
+
+## rmcp 0.1.5 bugs and API limits you will rediscover the hard way
+
+- **`ResourceContents` serialises `mime_type`, not `mimeType`.** Its `rename_all = "camelCase"` sits on
+  the *enum*, which renames the variants but not the fields inside them. So any media type set on a
+  `resources/read` result goes on the wire under a key that is not in the MCP schema. The server
+  therefore omits the field (it is optional in the spec) instead of emitting it wrongly;
+  `resources/list` still carries a correct `mimeType`, because `RawResource` is a *struct*, whose
+  `rename_all` does apply. `tests/mcp_features.rs` pins this so an rmcp upgrade flags it.
+- **Tool annotations, `outputSchema`/`structuredContent`, icons and resource links do not exist on
+  this pin** (they are 2025-03-26 / 2025-06-18). Do not add code that expects them.
+- **rmcp cancels the request `CancellationToken` itself** when `notifications/cancelled` arrives
+  (`service.rs`, before the handler hook), so `on_cancelled` needs to do nothing. `on_progress` has
+  nothing to report either: every tool is one atomic call returning its whole result. Both are
+  implemented as explicit no-ops so the decision is on record, and the tests assert the server does
+  not reply to or break on such notifications.
+- **`LoggingLevel` derives `PartialEq` but not `Ord`**, so `server.rs` has a `rank()` helper to order
+  them. Do not try to derive it on the SDK type.
+
+## Pushed notifications cannot be asserted with a timeout
+
+Two things make this subtle, and both bit while writing `tests/mcp_features.rs`:
+
+1. **A notification can arrive before the response that caused it.** It is sent from a detached task,
+   so a reader waiting for `id = N` may read it first. `tests/support/mod.rs` **buffers**
+   notifications rather than skipping them (`Server::pending`, `buffered`, `notification_containing`).
+   Skipping them loses messages and makes tests wait for one that already arrived.
+2. **No single notification's arrival proves the stream is drained.** Each write announces from its own
+   detached task, so two writes interleave freely and a whole batch can still be unscheduled. A test
+   that checks "nothing was pushed" right after a write therefore passes even when something *was* —
+   it was merely late. `Server::quiesce` drives harmless round-trips until the server stops pushing.
+
+Ordering *within* one `announce_write` is fixed (log line, then each invalidated resource, on one FIFO
+sink), and only that ordering may be relied on. Never assert an order *across* writes.
+
+Each assertion like this was checked against a deliberately broken implementation. The four that
+matter: dropping the subscription filter, announcing a resource the write did not invalidate, ignoring
+`logging/setLevel`, and announcing regardless of subscription.
+
+## Pagination needs a configurable page size to be testable
+
+Every catalogue here fits on a default page, so a cursor bug would be unreachable by a test. Hence
+`server.list_page_size` (`MCP_LIST_PAGE_SIZE`, default 20, must be ≥ 1) and
+`tests/mcp_features.rs` setting it to 3. `server.rs::page` holds the rule: the cursor is the index of
+the page's first item, decimal-encoded; an unparsable cursor is `invalid_params` rather than a silent
+full list, and a cursor past the end is an empty final page rather than an error, so a plain loop
+terminates.
 
 ## One URL, three backends
 
@@ -127,10 +214,9 @@ reason `breaker` has one.
 `rmcp = "0.1"` resolves to **0.1.5**. Do not copy 3.x examples (docs.rs "latest" shows 3.5):
 
 - 0.1 has **no `#[tool_router]` / `#[tool_handler]` macros** and no `ToolRouter` type.
-- Tools are declared with `#[tool]` + a `#[tool_box]` impl block, and `ServerHandler` must be
-  annotated **twice** — once on the inherent `impl Calculator` (builds the static tool box) and
-  once on `impl ServerHandler for Calculator` (generates `list_tools` / `call_tool`).
-  Forgetting the second one silently leaves `tools/list` empty.
+- Tools are declared with `#[tool]` + a `#[tool_box]` impl block. On the **inherent** `impl Calculator`
+  that annotation builds the static tool box; on `impl ServerHandler for Calculator` it would generate
+  `list_tools`/`call_tool` — but this crate writes those out instead, see above.
 - Per-arg schema comes from `#[tool(param)]`; complex input from `#[tool(aggr)]` on a single
   struct deriving `serde::Deserialize` + `schemars::JsonSchema` (via `rmcp::schemars`).
 - A tool returns anything implementing `IntoContents` (`String`, `Content`, `()`), or
@@ -180,8 +266,10 @@ result. That is not a bug; do not "fix" it by awaiting the write.
 
 `rmcp`'s `ServerInfo::default()` reports `serverInfo` as `rmcp` + the *SDK's* version and
 advertises **no** capabilities (`"capabilities":{}`), so a client sees zero tools. `get_info` in
-`src/server.rs` must set `server_info` (from `CARGO_PKG_NAME`/`CARGO_PKG_VERSION`) and
-`capabilities: ServerCapabilities::builder().enable_tools().build()` explicitly.
+`src/server.rs` must set `server_info` (from `CARGO_PKG_NAME`/`CARGO_PKG_VERSION`) and the
+capabilities explicitly — and see "Server capabilities: advertise only what is implemented" for why
+that list is short and deliberate. `instructions` is where the client learns that history exists;
+`tests/stdio_protocol.rs` asserts it still mentions `DATABASE_URL`.
 
 ## Configuration is layered, and the file layer is optional
 
@@ -261,11 +349,22 @@ podman-compose -f .devcontainer/compose.yaml down -v     # -v also drops the pgd
 
 ## Tests
 
-Four layers, and each assertion lives in exactly one of them — do not duplicate:
+**Every test lives in `tests/`. There is no `#[cfg(test)]` module in `src/`** — do not add one back.
+Each file is one layer, and each assertion lives in exactly one of them; do not duplicate.
 
-- `tests/stdio_protocol.rs` spawns the **real binary** over stdio and speaks raw JSON-RPC. This is
-  the only layer that proves the protocol itself works (capabilities, `tools/list`, argument
-  validation, tool errors vs JSON-RPC errors, stdout purity).
+- `tests/stdio_protocol.rs` spawns the **real binary** over stdio and speaks raw JSON-RPC. Protocol
+  mechanics: capabilities (and the ones deliberately *not* advertised), `ping`, `tools/list`, argument
+  validation, tool errors vs JSON-RPC errors, stdout purity, and that progress/cancellation
+  notifications leave the server working.
+- `tests/mcp_features.rs` covers every feature *beyond* tools through the same transport: the prompt
+  catalogue and its validation, resource routing and degradation, subscription announcements, the
+  logging level filter, completion, and a cursor walk over all four paginated methods. A handler can be
+  perfectly correct and never routed, which is why these are not unit tests.
+- `tests/server.rs` drives the `Calculator` and its `ServerHandler` hooks directly, where a failure
+  points at one function. Tools are called through the **public `ServerHandler::call_tool`**, because
+  rmcp's `#[tool]` macro keeps them private and `server::testing` deliberately does not widen that.
+- `tests/prompts.rs` / `tests/resources.rs` treat the two catalogues as pure functions: rendering,
+  argument validation, URI routing, and reads against an in-memory SQLite store.
 - `tests/store_offline.rs` exercises the public `Store`/`HistoryEntry` surface **without** a live
   database: scheme→backend selection, disabled storage, unparsable and unsupported URLs, bounded
   failure, breaker tripping, fire-and-forget writes. Runs against a dead PostgreSQL *and* a dead
@@ -274,12 +373,29 @@ Four layers, and each assertion lives in exactly one of them — do not duplicat
   the only one that can be: embedded, in-process, nothing to install. It covers migrations, a JSON
   and a timestamp column surviving a round trip, newest-first ordering, `DELETE` row counts, and a
   file-backed database persisting across two stores.
-- `tests/config.rs` pins the layering: precedence, defaults with no file at all, blank-value
-  handling, rejected unknown keys and out-of-range values, CLI parsing, and that resolved settings
-  and the resolved URL's backend reach the `Store`.
-- `#[cfg(test)]` modules in `src/` keep only what needs private access (rmcp's macro makes the tool
-  fns private; the breaker internals, the shared schema cell, the per-dialect SQL and the SQLite URL
-  parsing are reachable only from inside `db.rs`).
+- `tests/config.rs` pins the layering: precedence, defaults with no file at all, blank-value handling,
+  rejected unknown keys and out-of-range values, CLI parsing, and that resolved settings and the
+  resolved URL's backend reach the `Store`.
+- `tests/db.rs` holds the few behaviours no public API can reach — the circuit breaker's bookkeeping,
+  the shared schema cell, the per-dialect SQL and migration sets, SQLite URL parsing.
+
+### `db::testing` and `server::testing` exist for `tests/`
+
+Both are `#[doc(hidden)] pub mod` shims wrapping internals that are still declared `fn`. A child
+module can already read its parent's private items, so **nothing outside those two modules was made
+`pub`** — the rendered API is unchanged, which is why this route was chosen over widening the items
+in place.
+
+The rule that follows: if a new test needs private access, add a shim to the relevant `testing` module
+rather than adding `pub` to the item. If a test can be written against the public surface, it does not
+belong in `tests/db.rs` at all — put it in `tests/store_offline.rs` or `tests/sqlite_backend.rs`.
+
+### `tests/support/mod.rs`
+
+The shared JSON-RPC harness (not a test binary — Cargo compiles it into each of the two protocol-level
+files). It carries `#![allow(dead_code)]`, because an item only one of them needs is dead code in the
+other. It also exports `request_context()` for calling handlers without a transport. Read it before
+changing how tests talk to the server; see "Pushed notifications cannot be asserted with a timeout".
 
 Rules for the suite:
 
@@ -292,13 +408,17 @@ Rules for the suite:
   `wait_for_history` in `tests/sqlite_backend.rs` is the sanctioned way to observe one. Do not make
   the insert path awaitable just to make a test simpler.
 - Anything spawning the server must set `env!("CARGO_BIN_EXE_poc-rust-mcp")`, `env_remove`
-  `DATABASE_URL` so an ambient value cannot change what is under test, and `kill_on_drop(true)`.
+  `DATABASE_URL` so an ambient value cannot change what is under test, and `kill_on_drop(true)`. A
+  test that needs another setting must `env_remove` its ambient value too, or the developer's shell
+  decides what the test proves.
 - Read each JSON-RPC response **before** closing stdin; rmcp 0.1.5 drops in-flight responses at EOF.
 - Time budgets must be *tighter* than the behaviour they guard. The acquire timeout is 3s, so the
   "arithmetic never blocks on the database" guard uses a 1s budget — a 5s budget silently passes
-  even when the fire-and-forget write has been turned back into a blocking one.
-- `ToolBox::list()` is backed by a `HashMap`, so tool order is **not deterministic** — sort before
-  asserting.
+  even when the fire-and-forget write has been turned back into a blocking one. The same logic
+  applies to `Server::quiesce`, whose settle window (20ms) must be far longer than a scheduling turn.
+- `ToolBox::list()` is backed by a `HashMap`, so the tool list is sorted by the server rather than
+  reported in map order. The prompt and resource catalogues keep their declaration order, which is
+  stable too — but only *within* one list, and never across two writes' notifications.
 - Recovering from a tripped breaker takes 30s by design, so it is verified manually, not in the
   suite.
 
@@ -319,3 +439,10 @@ No CI, no `[lints]` table — clippy defaults only, so `-D warnings` must pass c
 - `tracing-subscriber` needs `features = ["env-filter"]` for `RUST_LOG` support; it is not a default.
   `config.rs` also uses `EnvFilter::try_new` to reject a bad filter at startup.
 - `Cargo.lock` is **committed** (only `/target` is ignored). Commit it whenever deps change.
+- **Licensing: BSD 2-Clause, and `LICENSE` is the authoritative copy.** There are no per-file
+  headers, which is the usual Rust convention — do not add one without being asked. Three places
+  mention the licence and must agree: the SPDX identifier `license = "BSD-2-Clause"` in
+  `Cargo.toml`, the header in `LICENSE`, and the `## License` section in `README.md`. The `LICENSE`
+  text is the SPDX `BSD-2-Clause` template verbatim with only the year and copyright holder
+  substituted, so do not reflow it; if the variant ever changes to 3-Clause (which adds a
+  non-endorsement clause), change all three and replace the file with the SPDX `BSD-3-Clause` text.

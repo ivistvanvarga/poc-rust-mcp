@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! The storage layer against a **real** database.
 //!
 //! `Store` dispatches every query to whichever of the three sqlx backends the URL selected, and only

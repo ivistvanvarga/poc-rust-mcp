@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! The `Calculator`: its tools, its `ServerHandler` hooks, and its page size.
 //!
 //! Relocated here from `src/server.rs`, with one deliberate rewrite: the tool functions are

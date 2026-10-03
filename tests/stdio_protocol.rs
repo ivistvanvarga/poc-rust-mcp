@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! End-to-end tests that drive the compiled binary over the real stdio JSON-RPC transport.
 //!
 //! These cover the *protocol mechanics* — the handshake, the advertised capabilities, the JSON-RPC

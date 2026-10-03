@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! The prompt catalogue.
 //!
 //! A prompt is not a tool and runs nothing: `prompts/get` returns messages that the client hands to

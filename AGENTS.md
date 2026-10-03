@@ -439,10 +439,16 @@ No CI, no `[lints]` table — clippy defaults only, so `-D warnings` must pass c
 - `tracing-subscriber` needs `features = ["env-filter"]` for `RUST_LOG` support; it is not a default.
   `config.rs` also uses `EnvFilter::try_new` to reject a bad filter at startup.
 - `Cargo.lock` is **committed** (only `/target` is ignored). Commit it whenever deps change.
-- **Licensing: BSD 2-Clause, and `LICENSE` is the authoritative copy.** There are no per-file
-  headers, which is the usual Rust convention — do not add one without being asked. Three places
-  mention the licence and must agree: the SPDX identifier `license = "BSD-2-Clause"` in
-  `Cargo.toml`, the header in `LICENSE`, and the `## License` section in `README.md`. The `LICENSE`
-  text is the SPDX `BSD-2-Clause` template verbatim with only the year and copyright holder
-  substituted, so do not reflow it; if the variant ever changes to 3-Clause (which adds a
-  non-endorsement clause), change all three and replace the file with the SPDX `BSD-3-Clause` text.
+- **Licensing: BSD 3-Clause, and `LICENSE` is the authoritative copy.** Every Rust file and the
+  verification script carries an `SPDX-License-Identifier: BSD-3-Clause` header on its first line (after
+  the shebang, in the script). Keep it there when adding files. Three more places mention the licence
+  and must agree: the SPDX identifier `license = "BSD-3-Clause"` in `Cargo.toml`, the header in
+  `LICENSE`, and the `## License` section in `README.md`. The `LICENSE` text is the SPDX
+  `BSD-3-Clause` template verbatim with only the year and copyright holder substituted, so do not
+  reflow it. Clause 3 is the non-endorsement clause; dropping it would make this the *2*-Clause
+  variant, so the two cannot be changed independently.
+- **Never add a header to `migrations/*.sql`, not even a comment.** sqlx stores each migration's
+  SHA-384 as its checksum, so a single added byte makes every existing PostgreSQL deployment fail the
+  next storage call with `VersionMismatch`. `tests/db.rs` pins the shipped file against the migrator's
+  embedded copy for exactly this reason. A licence header in a migration would cost more than it is
+  worth; the repository's `LICENSE` covers those files anyway.

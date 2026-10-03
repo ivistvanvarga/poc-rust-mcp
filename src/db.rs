@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 use std::{
     str::FromStr,
     sync::{Arc, Mutex},

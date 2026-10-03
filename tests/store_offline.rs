@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! Storage behaviour that must hold **without a live database**.
 //!
 //! `Store` is designed so that a missing or unreachable database degrades instead of breaking the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! The layered configuration framework: defaults < TOML file < environment < CLI flags.
 //!
 //! [`Env`] is injected rather than read from the process environment, which keeps these tests

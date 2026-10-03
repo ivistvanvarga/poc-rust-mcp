@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! A minimal JSON-RPC client for the compiled binary, over the real stdio transport.
 //!
 //! Both `tests/stdio_protocol.rs` and `tests/mcp_features.rs` drive the server this way, because

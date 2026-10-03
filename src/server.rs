@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! The MCP server: tools, prompts, resources, logging and completion, all over one `Calculator`.
 //!
 //! rmcp 0.1.5 exposes a hook per MCP server-side feature, and [`impl ServerHandler`] implements all

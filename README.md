@@ -441,5 +441,6 @@ let calculator = Calculator::new(Store::from_settings(&config.storage));
 
 ## License
 
-BSD 2-Clause. The full text is in [`LICENSE`](LICENSE); `Cargo.toml` declares the SPDX identifier
-`BSD-2-Clause`, and the two must stay in step.
+BSD 3-Clause, © 2026 iv.istvan.varga. The full text is in [`LICENSE`](LICENSE); `Cargo.toml` declares
+the SPDX identifier `BSD-3-Clause`, and every Rust file and the verification script carries an
+`SPDX-License-Identifier` header. The two must stay in step.

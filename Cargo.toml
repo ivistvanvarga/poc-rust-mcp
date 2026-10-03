@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 # The full text is in LICENSE. Keep the SPDX identifier here and the header in LICENSE in step:
 # `cargo` warns if a crate declares a license it has no `LICENSE` file for, and vice versa.
-license = "BSD-2-Clause"
-authors = ["iv.istvan.varga"]
+license = "BSD-3-Clause"
+authors = ["iv.istvan.varga <iv.istvan.varga@gmail.com>"]
 
 [dependencies]
 rmcp = { version = "0.1", features = [

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! `db` internals that no public API can reach.
 //!
 //! Relocated here from `src/db.rs`. Everything here goes through `db::testing`, the

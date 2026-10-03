@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! Layered configuration for the MCP server.
 //!
 //! Four layers, each overriding the previous one:

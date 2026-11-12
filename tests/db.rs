@@ -56,6 +56,25 @@ async fn clones_share_one_schema_cell() {
 }
 
 #[test]
+fn redacted_urls_keep_the_backend_but_never_the_credentials() {
+    let cases = [
+        (
+            "postgres://mcp:supersecret@example.com:5432/mcp?password=alsosecret",
+            "postgres://***@example.com:5432/mcp",
+        ),
+        (
+            "mysql://user@[::1]:3306/db?ssl-mode=REQUIRED",
+            "mysql://***@[::1]:3306/db",
+        ),
+        ("postgres://example.com/mcp", "postgres://example.com/mcp"),
+        ("not-a-url", "<redacted>"),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(testing::redact_url(input), expected, "{input}");
+    }
+}
+
+#[test]
 fn a_url_without_a_supported_scheme_is_rejected_by_name() {
     // The message has to name the alternatives, otherwise a typo looks like "storage off".
     let no_scheme = Dialect::from_url("mcp.db").unwrap_err();

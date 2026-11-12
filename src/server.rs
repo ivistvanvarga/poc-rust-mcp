@@ -421,7 +421,7 @@ impl ServerHandler for Calculator {
         // Refuse a URI this server does not serve rather than accepting a subscription that could
         // never fire: a silent no-op subscription is worse than an error the client can act on.
         resources::parse(&request.uri)?;
-        tracing::debug!(uri = %request.uri, "client subscribed to a resource");
+        tracing::debug!(uri = ?request.uri, "client subscribed to a resource");
         self.subscriptions
             .lock()
             .expect("subscriptions mutex poisoned")
@@ -440,7 +440,7 @@ impl ServerHandler for Calculator {
             .lock()
             .expect("subscriptions mutex poisoned")
             .remove(&request.uri);
-        tracing::debug!(uri = %request.uri, "client unsubscribed from a resource");
+        tracing::debug!(uri = ?request.uri, "client unsubscribed from a resource");
         Ok(())
     }
 
@@ -496,7 +496,7 @@ impl ServerHandler for Calculator {
     /// server neither replies to nor breaks on such notifications.
     async fn on_cancelled(&self, notification: rmcp::model::CancelledNotificationParam) {
         tracing::debug!(
-            id = %notification.request_id,
+            id = ?notification.request_id,
             reason = ?notification.reason,
             "cancellation received; no in-flight work to abandon"
         );

@@ -43,6 +43,37 @@ const fn is_connectivity_error(error: &sqlx::Error) -> bool {
     )
 }
 
+/// A client-facing category for a storage failure.
+///
+/// Tool results and MCP errors are visible to whoever is connected, and a raw `sqlx::Error` can
+/// name the host, the driver, the SQL, or a password embedded in the connection string. The full
+/// error still reaches `tracing` through [`Store::finish`]; the client gets only this category.
+const fn describe_storage_error(error: &sqlx::Error) -> &'static str {
+    if is_connectivity_error(error) {
+        "database unreachable"
+    } else if matches!(error, sqlx::Error::Database(_)) {
+        "database rejected the request"
+    } else {
+        "internal storage error"
+    }
+}
+
+/// A client-facing category for a migration failure, for the same reason as
+/// [`describe_storage_error`]: `MigrateError` embeds the driver error, which can name the host.
+const fn describe_migration_error(error: &sqlx::migrate::MigrateError) -> &'static str {
+    use sqlx::migrate::MigrateError;
+    match error {
+        MigrateError::VersionMismatch(_) => "migration checksum mismatch",
+        MigrateError::VersionMissing(_)
+        | MigrateError::VersionTooOld(_, _)
+        | MigrateError::VersionTooNew(_, _)
+        | MigrateError::VersionNotPresent(_) => {
+            "migration history does not match the embedded migrations"
+        }
+        _ => "migration failed",
+    }
+}
+
 /// A single recorded calculator call, as returned to MCP clients.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct HistoryEntry {
@@ -117,6 +148,32 @@ impl From<&StorageConfig> for Limits {
     }
 }
 
+/// Keep the scheme, authority host and path; replace userinfo and drop the query/fragment.
+///
+/// Database URLs carry passwords in their userinfo (and sometimes in query parameters such as
+/// `?password=`), so neither may reach a log line or a client-facing error verbatim. The host and
+/// path are kept because "which database is this?" is the question the log had to answer.
+#[must_use]
+pub fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "<redacted>".to_owned();
+    };
+    if scheme.is_empty() {
+        return "<redacted>".to_owned();
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let path = rest[authority_end..]
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let userinfo = if authority.contains('@') { "***@" } else { "" };
+    format!("{scheme}://{userinfo}{host}{path}")
+}
+
 /// Which database [`Store`] talks to, decided by the URL's scheme.
 ///
 /// These are the three drivers `sqlx` 0.8 implements itself. Each one carries its own SQL dialect
@@ -160,7 +217,7 @@ impl Dialect {
         let Some((scheme, _)) = url.split_once(':') else {
             return Err(format!(
                 "expected a database URL starting with one of {}: (for example \
-                 postgres://mcp:mcp@127.0.0.1:5432/mcp), found {url:?}",
+                 postgres://mcp:mcp@127.0.0.1:5432/mcp)",
                 Self::SCHEMES.join(", ")
             ));
         };
@@ -279,7 +336,8 @@ impl Pool {
     fn connect(url: &str, dialect: Dialect, limits: Limits) -> Result<Self, String> {
         match dialect {
             Dialect::Postgres => {
-                let options = PgConnectOptions::from_str(url).map_err(|error| error.to_string())?;
+                let options = PgConnectOptions::from_str(url)
+                    .map_err(|_| "database URL is not valid for the postgres backend".to_owned())?;
                 Ok(Self::Postgres(
                     PgPoolOptions::new()
                         .max_connections(limits.max_connections)
@@ -288,8 +346,8 @@ impl Pool {
                 ))
             }
             Dialect::MySql => {
-                let options =
-                    MySqlConnectOptions::from_str(url).map_err(|error| error.to_string())?;
+                let options = MySqlConnectOptions::from_str(url)
+                    .map_err(|_| "database URL is not valid for the mysql backend".to_owned())?;
                 Ok(Self::MySql(
                     MySqlPoolOptions::new()
                         .max_connections(limits.max_connections)
@@ -299,8 +357,8 @@ impl Pool {
             }
             Dialect::Sqlite => {
                 let (database, params) = sqlite_url_parts(url);
-                let mut options =
-                    SqliteConnectOptions::from_str(url).map_err(|error| error.to_string())?;
+                let mut options = SqliteConnectOptions::from_str(url)
+                    .map_err(|_| "database URL is not valid for the sqlite backend".to_owned())?;
                 // Create the file if it is missing, so `sqlite://mcp.db` works on a fresh checkout.
                 // A URL pinned to `mode=ro`/`mode=rw` means "this file must already exist".
                 if !matches!(sqlite_param(params, "mode"), Some("ro" | "rw")) {
@@ -464,7 +522,11 @@ impl Store {
         match Self::try_connect(url, limits) {
             Ok(store) => store,
             Err(error) => {
-                warn!(%error, "unusable database URL; serving calculator tools without history");
+                warn!(
+                    url = %redact_url(url),
+                    error = %error,
+                    "unusable database URL; serving calculator tools without history"
+                );
                 Self::with_backend(None, limits)
             }
         }
@@ -568,7 +630,8 @@ impl Store {
             }
             Err(error) => {
                 self.note_failure(&error);
-                Err(format!("{context}: {error}"))
+                warn!(%error, %context, "storage operation failed");
+                Err(format!("{context}: {}", describe_storage_error(&error)))
             }
         }
     }
@@ -600,7 +663,11 @@ impl Store {
                             }
                             _ => {}
                         }
-                        Err(format!("failed to apply migrations: {error}"))
+                        warn!(%error, dialect = dialect.label(), "database migration failed");
+                        Err(format!(
+                            "failed to apply migrations: {}",
+                            describe_migration_error(&error)
+                        ))
                     }
                 }
             })
@@ -729,9 +796,13 @@ impl Store {
 #[doc(hidden)]
 pub mod testing {
     use super::{
-        Dialect, Migrator, POSTGRES_MIGRATIONS, Store, sqlite_is_in_memory as parse_in_memory,
-        sqlite_param as parse_param, sqlite_url_parts as parse_url_parts,
+        Dialect, Migrator, POSTGRES_MIGRATIONS, Store,
+        sqlite_is_in_memory as parse_in_memory, sqlite_param as parse_param,
+        sqlite_url_parts as parse_url_parts,
     };
+
+    /// See the public [`super::redact_url`].
+    pub use super::redact_url;
 
     /// Count a failure as the breaker sees it, without needing a real database.
     pub fn note_failure(store: &Store, error: &sqlx::Error) {

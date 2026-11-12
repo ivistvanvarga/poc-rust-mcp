@@ -18,3 +18,4 @@ pub mod db;
 pub mod prompts;
 pub mod resources;
 pub mod server;
+pub mod sse;

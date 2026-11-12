@@ -13,7 +13,7 @@ use std::{
 };
 
 use poc_rust_mcp::{
-    config::{Cli, Config, ConfigError, Env, MapEnv, Secret, ServerConfig, StorageConfig, SystemEnv, env_keys},
+    config::{Cli, Config, ConfigError, Env, MapEnv, ServerConfig, StorageConfig, SystemEnv, env_keys},
     db::{Dialect, Limits, Store},
     server::clamp_history_limit,
 };

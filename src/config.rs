@@ -469,7 +469,7 @@ Environment:
                  Rows per page for the MCP */list methods (default 20)
   MCP_SSE_ADDRESS, MCP_SSE_TOKEN, MCP_SSE_ALLOWED_HOSTS, MCP_SSE_ALLOWED_ORIGINS,
   MCP_SSE_MAX_SESSIONS
-                 See "SSE security" above.
+                 See the SSE security section above.
   MCP_STORAGE_*  See config.example.toml for the storage tuning knobs.
 
 See config.example.toml for every file setting.

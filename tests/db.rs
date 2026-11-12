@@ -11,6 +11,10 @@
 use poc_rust_mcp::db::{Dialect, Limits, Store, testing};
 use std::time::Duration;
 
+/// Same budget as the other degraded-storage tests: long enough to connect nowhere, short enough
+/// to keep the suite fast.
+const FAST: Duration = Duration::from_millis(250);
+
 #[test]
 fn successful_call_resets_the_breaker() {
     let store = Store::disabled();
@@ -72,6 +76,18 @@ fn redacted_urls_keep_the_backend_but_never_the_credentials() {
     for (input, expected) in cases {
         assert_eq!(testing::redact_url(input), expected, "{input}");
     }
+}
+
+#[tokio::test]
+async fn saturated_write_slots_drop_records_instead_of_blocking_the_caller() {
+    let store = Store::connect_with_timeout("postgres://mcp:mcp@127.0.0.1:1/mcp", FAST);
+    let held = testing::take_write_permits(&store);
+    assert_eq!(held.len(), poc_rust_mcp::db::MAX_PENDING_WRITES);
+    let started = std::time::Instant::now();
+    store.record_success("add", serde_json::json!({ "a": 1, "b": 1 }), "2");
+    assert_eq!(testing::dropped_writes(&store), 1);
+    assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    drop(held);
 }
 
 #[test]

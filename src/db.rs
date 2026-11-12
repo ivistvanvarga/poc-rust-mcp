@@ -1,6 +1,9 @@
 use std::{
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -12,7 +15,7 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 use tracing::{debug, warn};
 
 use crate::config::StorageConfig;
@@ -29,6 +32,14 @@ use crate::config::StorageConfig;
 static POSTGRES_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/postgres");
 static MYSQL_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/mysql");
 static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/sqlite");
+
+/// Upper bound on detached history writes in flight at once.
+///
+/// Writes are fire-and-forget, so a caller can enqueue them faster than a degraded database drains
+/// them. Without a bound the spawned tasks accumulate without limit; with one, an excess record is
+/// dropped (history is best-effort by design) rather than growing the process or blocking the tool
+/// call that produced it.
+pub const MAX_PENDING_WRITES: usize = 64;
 
 /// Whether a sqlx error means "the database is unreachable" as opposed to "the query was bad".
 /// Only the former should trip the breaker; a bad query must not disable storage.
@@ -449,6 +460,10 @@ pub struct Store {
     backend: Option<Pool>,
     schema: Arc<OnceCell<()>>,
     breaker: Arc<Mutex<Breaker>>,
+    /// Limits the number of detached inserts in flight; see [`MAX_PENDING_WRITES`].
+    writes: Arc<Semaphore>,
+    /// Records dropped because every write slot was taken, for tests and diagnosis.
+    dropped: Arc<AtomicUsize>,
     limits: Limits,
 }
 
@@ -548,6 +563,8 @@ impl Store {
             // `version`.
             schema: Arc::new(OnceCell::const_new()),
             breaker: Arc::default(),
+            writes: Arc::new(Semaphore::new(MAX_PENDING_WRITES)),
+            dropped: Arc::default(),
             limits,
         }
     }
@@ -699,7 +716,13 @@ impl Store {
     ) {
         let store = self.clone();
         let operation = operation.to_owned();
+        let Ok(permit) = self.writes.clone().try_acquire_owned() else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            debug!(%operation, "history write dropped: too many pending writes");
+            return;
+        };
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(insert_error) = store.insert(&operation, inputs, result, error).await {
                 debug!(
                     %insert_error,
@@ -877,5 +900,21 @@ pub mod testing {
     /// See the private `sqlite_is_in_memory`, which this mirrors.
     pub fn sqlite_is_in_memory(database: &str, params: Option<&str>) -> bool {
         parse_in_memory(database, params)
+    }
+
+    /// Take every pending-write permit, so the next write has nowhere to go.
+    pub fn take_write_permits(store: &Store) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let mut permits = Vec::new();
+        while let Ok(permit) = store.writes.clone().try_acquire_owned() {
+            permits.push(permit);
+        }
+        permits
+    }
+
+    /// How many records were dropped because every write slot was taken.
+    pub fn dropped_writes(store: &Store) -> usize {
+        store
+            .dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }

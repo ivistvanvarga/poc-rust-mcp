@@ -41,6 +41,12 @@ pub const LOGGER: &str = "poc-rust-mcp";
 /// Rows per page when a client does not ask otherwise.
 pub const DEFAULT_LIST_PAGE_SIZE: usize = 20;
 
+/// Upper bound on concurrent resource subscriptions from one client.
+///
+/// The set is per-`Calculator` and grows for the life of the session, so without a bound a client
+/// could make the server hold an arbitrary amount of memory one `resources/subscribe` at a time.
+pub const MAX_SUBSCRIPTIONS: usize = 256;
+
 /// Clamp a client-supplied history limit into `1..=max`.
 ///
 /// `max` comes from configuration (`storage.max_history_rows`) so a client can never ask for an
@@ -79,6 +85,7 @@ pub struct Calculator {
     /// The level from `logging/setLevel`; notifications below it are dropped.
     log_level: Arc<Mutex<LoggingLevel>>,
     list_page_size: usize,
+    subscription_limit: usize,
 }
 
 #[tool(tool_box)]
@@ -98,7 +105,17 @@ impl Calculator {
             subscriptions: Arc::default(),
             log_level: Arc::new(Mutex::new(LoggingLevel::Info)),
             list_page_size: list_page_size.max(1),
+            subscription_limit: MAX_SUBSCRIPTIONS,
         }
+    }
+
+    /// As [`Self::new`], with an upper bound on concurrent resource subscriptions. Zero is clamped
+    /// to one for the same reason as the page size: a limit of zero would reject every subscription,
+    /// duplicate or not.
+    #[must_use]
+    pub fn with_subscription_limit(mut self, limit: usize) -> Self {
+        self.subscription_limit = limit.max(1);
+        self
     }
 
     /// Names of every tool this server exposes, sorted.
@@ -225,11 +242,16 @@ impl Calculator {
     fn announce_write(&self, operation: &str, message: String) {
         let Some(peer) = self.peer() else { return };
         let send_log = self.level_enabled(LoggingLevel::Info);
-        let subscriptions = self.subscriptions();
-        let invalidated: Vec<String> = resources::invalidated_by_write(operation)
-            .into_iter()
-            .filter(|uri| subscriptions.contains(uri))
-            .collect();
+        let invalidated: Vec<String> = {
+            let subscriptions = self
+                .subscriptions
+                .lock()
+                .expect("subscriptions mutex poisoned");
+            resources::invalidated_by_write(operation)
+                .into_iter()
+                .filter(|uri| subscriptions.contains(uri))
+                .collect()
+        };
         if !send_log && invalidated.is_empty() {
             return;
         }
@@ -279,13 +301,6 @@ impl Calculator {
             .expect("log level mutex poisoned")
             .clone();
         rank(level) >= rank(configured)
-    }
-
-    fn subscriptions(&self) -> BTreeSet<String> {
-        self.subscriptions
-            .lock()
-            .expect("subscriptions mutex poisoned")
-            .clone()
     }
 }
 
@@ -421,11 +436,22 @@ impl ServerHandler for Calculator {
         // Refuse a URI this server does not serve rather than accepting a subscription that could
         // never fire: a silent no-op subscription is worse than an error the client can act on.
         resources::parse(&request.uri)?;
+        {
+            let mut subscriptions = self
+                .subscriptions
+                .lock()
+                .expect("subscriptions mutex poisoned");
+            if !subscriptions.contains(&request.uri)
+                && subscriptions.len() >= self.subscription_limit
+            {
+                return Err(rmcp::Error::invalid_params(
+                    "too many resource subscriptions",
+                    None,
+                ));
+            }
+            subscriptions.insert(request.uri.clone());
+        }
         tracing::debug!(uri = ?request.uri, "client subscribed to a resource");
-        self.subscriptions
-            .lock()
-            .expect("subscriptions mutex poisoned")
-            .insert(request.uri);
         Ok(())
     }
 

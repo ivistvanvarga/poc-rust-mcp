@@ -91,6 +91,15 @@ async fn saturated_write_slots_drop_records_instead_of_blocking_the_caller() {
 }
 
 #[test]
+fn prune_sql_uses_the_dialect_placeholder_and_mysql_derived_table() {
+    assert!(testing::prune_sql(Dialect::Postgres).contains("$1"));
+    assert!(testing::prune_sql(Dialect::Sqlite).contains('?'));
+    let mysql = testing::prune_sql(Dialect::MySql);
+    assert!(mysql.contains("DELETE h FROM"), "{mysql}");
+    assert!(mysql.contains("LEFT JOIN"), "{mysql}");
+}
+
+#[test]
 fn a_url_without_a_supported_scheme_is_rejected_by_name() {
     // The message has to name the alternatives, otherwise a typo looks like "storage off".
     let no_scheme = Dialect::from_url("mcp.db").unwrap_err();

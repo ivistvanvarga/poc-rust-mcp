@@ -308,6 +308,26 @@ impl Dialect {
         "DELETE FROM calc_history"
     }
 
+    /// Keep only the newest `max_history_rows` rows.
+    ///
+    /// MySQL will not accept a subquery over the table being deleted from in `NOT IN`, so it gets a
+    /// derived-table join instead; the other two accept the portable form.
+    fn prune_sql(self) -> String {
+        let keep = format!(
+            "SELECT id FROM calc_history ORDER BY created_at DESC, id DESC LIMIT {}",
+            self.placeholder(1)
+        );
+        match self {
+            Self::Postgres | Self::Sqlite => {
+                format!("DELETE FROM calc_history WHERE id NOT IN ({keep})")
+            }
+            Self::MySql => format!(
+                "DELETE h FROM calc_history h LEFT JOIN ({keep}) keep ON h.id = keep.id \
+                 WHERE keep.id IS NULL"
+            ),
+        }
+    }
+
     fn count_sql(self) -> &'static str {
         "SELECT count(*) FROM calc_history"
     }
@@ -759,11 +779,36 @@ impl Store {
                 .await
                 .map(|_| ())
         });
-        self.finish(executed, "failed to insert history")
+        self.finish(executed, "failed to insert history")?;
+        if let Err(prune_error) = self.prune(&backend).await {
+            debug!(%prune_error, "history pruning failed; the insert still succeeded");
+        }
+        Ok(())
     }
 
-    /// Most recent entries first.
+    /// Delete everything but the newest [`Limits::max_history_rows`] rows.
+    ///
+    /// The cap is the same setting `calc_history` uses for its read limit, so the tool's promise
+    /// ("the newest N") and what the database keeps cannot drift apart.
+    async fn prune(&self, backend: &Pool) -> Result<(), String> {
+        let sql = backend.dialect().prune_sql();
+        let executed = with_pool!(backend, |pool| {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(self.limits.max_history_rows)
+                .execute(pool)
+                .await
+                .map(|_| ())
+        });
+        self.finish(executed, "failed to prune history")
+    }
+
+    /// Most recent entries first, at most [`Limits::max_history_rows`] rows.
+    ///
+    /// The argument is clamped even though the tool already clamps it: `Store` is a public API, and
+    /// SQLite treats a negative `LIMIT` as "unlimited", so an unclamped value here would be a way
+    /// around the configured cap.
     pub async fn list(&self, limit: i64) -> Result<Vec<HistoryEntry>, String> {
+        let limit = limit.clamp(1, self.limits.max_history_rows.max(1));
         let backend = self.ensure_schema().await?;
         let sql = backend.dialect().list_sql();
         let fetched = with_pool!(backend, |pool| {
@@ -869,6 +914,11 @@ pub mod testing {
     /// The `SELECT` a backend would send, placeholders included.
     pub fn list_sql(dialect: Dialect) -> String {
         dialect.list_sql()
+    }
+
+    /// The retention `DELETE` a backend would send, placeholders included.
+    pub fn prune_sql(dialect: Dialect) -> String {
+        dialect.prune_sql()
     }
 
     /// The migrations a backend would apply.

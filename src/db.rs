@@ -657,7 +657,9 @@ impl Store {
         // `()` as the normalised result: an insert's row count is not interesting, but the three
         // `QueryResult` types are not the same type, so the arms need a common one.
         let executed = with_pool!(backend, |pool| {
-            sqlx::query(&sql)
+            // The text is assembled from static fragments and bind placeholders only — no user
+            // input is ever interpolated — so the audit sqlx asks for is satisfied above.
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(operation)
                 .bind(inputs)
                 .bind(result)
@@ -675,7 +677,7 @@ impl Store {
         let backend = self.ensure_schema().await?;
         let sql = backend.dialect().list_sql();
         let fetched = with_pool!(backend, |pool| {
-            sqlx::query_as::<_, HistoryEntry>(&sql)
+            sqlx::query_as::<_, HistoryEntry>(sqlx::AssertSqlSafe(sql))
                 .bind(limit)
                 .fetch_all(pool)
                 .await
@@ -788,7 +790,7 @@ pub mod testing {
         POSTGRES_MIGRATIONS
             .iter()
             .next()
-            .map(|migration| migration.sql.to_string())
+            .map(|migration| migration.sql.as_str().to_owned())
     }
 
     /// See the private `sqlite_url_parts`, which this mirrors.

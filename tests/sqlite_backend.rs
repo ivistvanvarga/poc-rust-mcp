@@ -265,6 +265,48 @@ async fn history_is_pruned_to_the_configured_row_cap_when_writes_are_concurrent(
     assert_eq!(store.list(1000).await.expect("listing").len(), 3);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_new_sqlite_file_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = TempDb::new();
+    let store = Store::connect(&path.url());
+    store.status().await.expect("the database should be usable");
+    let mode = std::fs::metadata(path.path())
+        .expect("the file should exist")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "new history files must not be group/world readable"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn existing_sqlite_file_permissions_are_left_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = TempDb::new();
+    std::fs::write(path.path(), b"").expect("create the file");
+    std::fs::set_permissions(path.path(), std::fs::Permissions::from_mode(0o644))
+        .expect("set a shared mode");
+    let store = Store::connect(&path.url());
+    store.status().await.expect("the database should be usable");
+    let mode = std::fs::metadata(path.path())
+        .expect("the file should exist")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o644, "an existing file must keep its mode");
+}
+
+#[tokio::test]
+async fn an_uncreatable_sqlite_path_degrades_to_disabled_storage() {
+    let store = Store::connect("sqlite:///definitely/missing/poc-rust-mcp/db.sqlite");
+    assert!(!store.is_configured(), "a bad path must not look healthy");
+}
+
 #[tokio::test]
 async fn clear_reports_the_number_of_rows_it_removed() {
     // The reason `clear` uses DELETE rather than TRUNCATE: TRUNCATE carries no row count on

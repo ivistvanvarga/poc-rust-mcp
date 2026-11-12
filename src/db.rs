@@ -1,4 +1,5 @@
 use std::{
+    path::Path,
     str::FromStr,
     sync::{
         Arc, Mutex,
@@ -390,6 +391,9 @@ impl Pool {
                 let (database, params) = sqlite_url_parts(url);
                 let mut options = SqliteConnectOptions::from_str(url)
                     .map_err(|_| "database URL is not valid for the sqlite backend".to_owned())?;
+                // Create the file ourselves first, so a new history database is owner-only rather
+                // than inheriting the process umask (usually 0644). An existing file is left alone.
+                prepare_sqlite_file(database, params, options.get_filename())?;
                 // Create the file if it is missing, so `sqlite://mcp.db` works on a fresh checkout.
                 // A URL pinned to `mode=ro`/`mode=rw` means "this file must already exist".
                 if !matches!(sqlite_param(params, "mode"), Some("ro" | "rw")) {
@@ -462,6 +466,44 @@ fn sqlite_param<'a>(params: Option<&'a str>, key: &str) -> Option<&'a str> {
 /// Whether a SQLite URL names a private in-memory database rather than a file on disk.
 fn sqlite_is_in_memory(database: &str, params: Option<&str>) -> bool {
     database == ":memory:" || matches!(sqlite_param(params, "mode"), Some("memory"))
+}
+
+/// Create a missing SQLite history file with owner-only permissions, and never touch an existing one.
+///
+/// `create_if_missing(true)` would create the file with the process umask, which is commonly `0644`;
+/// the history contains every calculation a client sent. An operator who already has a file keeps
+/// whatever mode they chose — a silent `chmod` on connect would be a surprise, and this process may
+/// not be the file's owner.
+fn prepare_sqlite_file(
+    database: &str,
+    params: Option<&str>,
+    path: &Path,
+) -> Result<(), String> {
+    if sqlite_is_in_memory(database, params)
+        || matches!(sqlite_param(params, "mode"), Some("ro" | "rw"))
+    {
+        return Ok(());
+    }
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    match open.open(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
+                Ok(())
+            } else {
+                Err("sqlite database path exists but is not a regular file".to_owned())
+            }
+        }
+        // The path is deliberately absent: it is operator-supplied and may itself be sensitive,
+        // and the caller logs the URL (redacted) already.
+        Err(_) => Err("cannot create the sqlite database file".to_owned()),
+    }
 }
 
 /// Optional database-backed storage for calculator history.

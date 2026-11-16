@@ -311,7 +311,11 @@ struct Session {
     cancel: CancellationToken,
 }
 
-/// Removes a session from the registry exactly once, however many clones exist.
+/// Frees one session on drop: cancels its token and removes it from the registry.
+///
+/// Two independent guards exist — one owned by the response stream, one by the transport — so
+/// whichever side ends first releases the slot instead of waiting for the other. Both may run;
+/// `HashMap::remove` and `CancellationToken::cancel` are idempotent.
 struct SessionCleanup {
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     id: String,
@@ -332,7 +336,7 @@ impl Drop for SessionCleanup {
 struct SseTransport {
     stream: ReceiverStream<RxJsonRpcMessage<RoleServer>>,
     sink: PollSender<TxJsonRpcMessage<RoleServer>>,
-    _cleanup: Arc<SessionCleanup>,
+    _cleanup: SessionCleanup,
 }
 
 impl Sink<TxJsonRpcMessage<RoleServer>> for SseTransport {
@@ -454,16 +458,25 @@ where
         );
     }
 
-    let cleanup = Arc::new(SessionCleanup {
+    // One guard per side, not a shared handle: dropping the HTTP response frees the session
+    // without waiting for the transport task, and a service that ends on its own frees it without
+    // waiting for the client. Removal is idempotent, so a disconnect and a service end may both
+    // run it.
+    let transport_cleanup = SessionCleanup {
         sessions: app.sessions.clone(),
         id: id.clone(),
         cancel: cancel.clone(),
-    });
+    };
+    let stream_cleanup = SessionCleanup {
+        sessions: app.sessions.clone(),
+        id: id.clone(),
+        cancel: cancel.clone(),
+    };
 
     let transport = SseTransport {
         stream: ReceiverStream::new(from_client_rx),
         sink: PollSender::new(to_client_tx),
-        _cleanup: cleanup.clone(),
+        _cleanup: transport_cleanup,
     };
     let service = (app.service)();
     let service_cancel = cancel.clone();
@@ -489,10 +502,10 @@ where
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     });
     let mut inner = Box::pin(endpoint.chain(messages));
-    // The stream owns a cleanup handle, so dropping the HTTP response (a disconnect) closes the
-    // session immediately rather than waiting for the transport task to notice.
+    // The stream owns its own guard, so dropping the HTTP response (a disconnect) frees the
+    // session at once rather than waiting for the transport task to notice the closed sink.
     let stream = futures::stream::poll_fn(move |cx| {
-        let _keep_alive = &cleanup;
+        let _keep_alive = &stream_cleanup;
         inner.as_mut().poll_next(cx)
     });
 

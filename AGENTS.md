@@ -258,9 +258,10 @@ event, `POST /message?sessionId=…`, `Sse`/`KeepAlive`, a `Sink`/`Stream` trans
 - **Sessions are bounded and cleaned up.** IDs are 32 CSPRNG bytes, hex-encoded; the registry is
   capped (`sse_max_sessions`, default 64, answering `503` + `Retry-After: 5` past it); each inbound
   queue holds `SESSION_QUEUE` (32) messages; a body over `MESSAGE_BODY_LIMIT` (256 KiB) is `413`.
-  `SessionCleanup` is held by both the HTTP stream and the transport, so a client disconnect removes
-  the map entry and cancels that session's `Calculator` — do not make cleanup depend on the transport
-  task noticing the drop.
+  The response stream and the transport each own a `SessionCleanup`, so a client disconnect removes
+  the map entry and cancels that session's `Calculator` without waiting for the transport task to
+  notice the drop, and a service that ends on its own does the same without waiting for the client.
+  Removal is idempotent — keep the two guards independent.
 
 ## Run modes
 
@@ -498,7 +499,8 @@ No CI, no `[lints]` table — clippy defaults only, so `-D warnings` must pass c
 `cargo audit` must also exit 0. `.cargo/audit.toml` records three reviewed ignores, each with its
 rationale: **RUSTSEC-2026-0189** (rmcp's Streamable HTTP server transport — unused; `src/sse.rs` is
 the only network transport), **RUSTSEC-2026-0459** (the bundled SQLite CVE, fixed only in
-`libsqlite3-sys >= 0.39`, which sqlx 0.9 excludes; local, needs a crafted database + WAL), and
+`libsqlite3-sys >= 0.39`, outside sqlx 0.9's `>= 0.30.1, < 0.38.0` range; local, needs a crafted
+database + WAL), and
 **RUSTSEC-2024-0436** (`paste` is unmaintained, not vulnerable; a build-time macro via rmcp 0.1.5).
 Add an ignore only with a written reason, here and in the file.
 
@@ -507,8 +509,8 @@ Add an ignore only with a written reason, here and in the file.
 - `rust-toolchain.toml` pins `stable` + `clippy`/`rustfmt`. Edition 2024 needs Rust >= 1.85.
 - `tracing-subscriber` needs `features = ["env-filter"]` for `RUST_LOG` support; it is not a default.
   `config.rs` also uses `EnvFilter::try_new` to reject a bad filter at startup.
-- `Cargo.lock` is **committed**. `.gitignore` contains only `/target` and `/config.toml`; commit the
-  lockfile whenever deps change.
+- `Cargo.lock` is **committed**. `.gitignore` contains only `/target`, `/config.toml` and `*.db`;
+  commit the lockfile whenever deps change.
 - **Licensing: BSD 3-Clause, and `LICENSE` is the authoritative copy.** Every Rust file and the
   verification script carries an `SPDX-License-Identifier: BSD-3-Clause` header on its first line (after
   the shebang, in the script). Keep it there when adding files. Three more places mention the licence

@@ -72,9 +72,9 @@ Each is a deliberate, documented trade-off rather than an oversight.
   `Host`/`Origin`/token validation rmcp omits. Upgrading rmcp would rewrite the tool layer, which is
   out of scope.
 - **Bundled SQLite — [RUSTSEC-2026-0459][rsec-0459].** Requires a crafted database plus WAL file that
-  the victim opens, and is local-only. sqlx 0.9 still pins `libsqlite3-sys < 0.38.0`; no compatible
-  fixed release exists. Operators who need the fix sooner can build against a patched system SQLite
-  with `sqlite-unbundled`.
+  the victim opens, and is local-only. The fix ships in `libsqlite3-sys 0.39.0`, but sqlx 0.9 requires
+  `>= 0.30.1, < 0.38.0` (the lock resolves `0.37.0`), so no compatible fixed release exists. Operators
+  who need the fix sooner can build against a patched system SQLite with `sqlite-unbundled`.
 - **`paste` — [RUSTSEC-2024-0436][rsec-0436].** Unmaintained, not vulnerable: a build-time macro
   dependency of rmcp 0.1.5, with no runtime component.
 - **Loopback SSE without a token.** Any local process can call the tools. Intended for local

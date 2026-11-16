@@ -85,7 +85,8 @@ Notes per backend:
 - **SQLite** creates the file if it is missing. A URL pinned to `?mode=ro` or `?mode=rw` means "this
   file must already exist" and is left alone. An in-memory database (`sqlite::memory:`) is capped at a
   single pooled connection, because SQLite's shared-cache mode takes *table* locks that its busy
-  handler cannot wait out.
+  handler cannot wait out. A file this process creates is mode `0600` on Unix; an existing file keeps
+  its mode, so run `chmod 600` to tighten one you already have.
 - **TLS** follows the URL and the driver's own default. This crate builds sqlx without a TLS feature,
   and every driver treats "no TLS compiled in" as "stay on plaintext" — so a local container works
   untouched, and enabling a TLS feature later upgrades automatically. For a managed database that
@@ -119,6 +120,10 @@ duration type.
 | --- | --- | --- | --- | --- |
 | — | `--config <PATH>` | `MCP_CONFIG` | none | TOML config file to load |
 | `server.sse_address` | `--sse [ADDR]` | `MCP_SSE_ADDRESS` | `127.0.0.1:8000` | Bind address for the SSE transport |
+| `server.sse_allowed_hosts` | — | `MCP_SSE_ALLOWED_HOSTS` | loopback names + bound port | `Host` values the SSE transport accepts; **required for a non-loopback bind**. A value without a port matches any port on that host |
+| `server.sse_allowed_origins` | — | `MCP_SSE_ALLOWED_ORIGINS` | unset (same-origin only) | Browser origins to accept; restriction only, no CORS. Unset ⇒ an `Origin` must match the request `Host` |
+| `server.sse_token` | — | `MCP_SSE_TOKEN` | unset | Bearer token required on every SSE request; header-only (`Authorization: Bearer …`), no CLI flag. **Required for a non-loopback bind** |
+| `server.sse_max_sessions` | — | `MCP_SSE_MAX_SESSIONS` | `64` | Maximum simultaneous SSE sessions |
 | `server.log_filter` | — | `RUST_LOG` | `info` | `tracing` filter; logs always go to **stderr** |
 | `server.list_page_size` | — | `MCP_LIST_PAGE_SIZE` | `20` | Rows per page for the MCP `*/list` methods |
 | `storage.url` | `--db-url <URL>` | `DATABASE_URL` | unset | Database URL; the scheme picks the backend. Unset, blank, unparsable or unsupported ⇒ storage disabled |
@@ -126,7 +131,7 @@ duration type.
 | `storage.acquire_timeout_ms` | — | `MCP_STORAGE_ACQUIRE_TIMEOUT_MS` | `3000` | How long an operation may wait for a connection |
 | `storage.breaker_threshold` | — | `MCP_STORAGE_BREAKER_THRESHOLD` | `2` | Connectivity failures before storage is skipped |
 | `storage.breaker_cooldown_ms` | — | `MCP_STORAGE_BREAKER_COOLDOWN_MS` | `30000` | How long the breaker stays open |
-| `storage.max_history_rows` | — | `MCP_STORAGE_MAX_HISTORY_ROWS` | `100` | Upper bound on rows `calc_history` returns |
+| `storage.max_history_rows` | — | `MCP_STORAGE_MAX_HISTORY_ROWS` | `100` | Rows kept in `calc_history` (pruned after every insert) and the upper bound on what it returns |
 
 A blank value counts as unset, so an empty `DATABASE_URL` exported by a compose file or CI job means
 "not configured" rather than "empty URL".
@@ -193,6 +198,36 @@ cargo run -- --sse 0.0.0.0:9000     # explicit bind address
 
 The client handshake over SSE is the usual sequence: open `GET /sse`, POST `initialize`, POST
 `notifications/initialized`, then POST tool calls.
+
+### SSE security
+
+`--sse` turns a local tool into a network service, so the transport validates every request before it
+reaches a handler. The checks run in order — `Host`, then `Origin`, then token — and a bad host or
+origin is `403` while a missing or wrong token is `401`.
+
+- **`Host` allowlist.** A loopback bind defaults to `localhost`, `127.0.0.1` and `[::1]`, pinned to
+  the port actually bound. A **non-loopback bind refuses to start** without an explicit
+  `MCP_SSE_ALLOWED_HOSTS`, because the server cannot know which names or addresses clients will use.
+  An entry without a port matches any port on that host; an entry with a port is pinned to it.
+- **Bearer token.** `MCP_SSE_TOKEN` is required for any non-loopback bind, and enforced on loopback
+  too when set. It is **header-only** — `Authorization: Bearer <token>` — compared in constant time.
+  There is deliberately **no CLI flag**, because a command line is visible in `ps` and shell history.
+  A browser `EventSource` cannot set the header, which is a feature here: a malicious page cannot
+  supply the token even if it passes the other checks. A browser UI needs a same-origin proxy that
+  adds the header.
+- **`Origin` allowlist.** `MCP_SSE_ALLOWED_ORIGINS` is a **restriction only**: the server emits no
+  CORS headers and answers no preflight. When it is unset, an `Origin` must match the request `Host`
+  (and its effective port, when the authority carried one). `Origin: null` is rejected.
+- **Reverse proxy.** Forward the **original `Host` header** (for example `proxy_set_header Host
+  $host;`); do not rely on `X-Forwarded-Host`, which this server does not read. A TLS proxy that
+  forwards `Host: mcp.example` alongside `Origin: https://mcp.example` is accepted by the same-origin
+  rule.
+- **Bounds.** Sessions are capped at `MCP_SSE_MAX_SESSIONS` (default 64; past it the server answers
+  `503` with `Retry-After`), each session queues at most 32 inbound messages, and a `/message` body
+  over 256 KiB is `413`.
+
+A non-loopback listener is refused unless **both** a token and an explicit host list are configured.
+See [`SECURITY.md`](SECURITY.md) for the threat model and the accepted risks.
 
 ### Smoke test without a client
 
@@ -312,6 +347,11 @@ these are the defaults.
   they succeed. Migrations are **per backend** — see below.
 - **History writes are fire-and-forget** (`tokio::spawn`), so a tool never waits for the database.
   The trade-off: a row can be lost if the process exits immediately after the tool returns.
+- **Retention is enforced, not just reads.** `max_history_rows` prunes the table to the newest N rows
+  after every insert, and `calc_history`'s `limit` is clamped to `1..=max_history_rows`, so neither the
+  disk nor a client can grow the history without bound.
+- **New SQLite files are owner-only (`0600`)** on Unix; an existing file keeps its mode, so tighten one
+  you already have with `chmod 600 path/to.db`.
 - **Every storage attempt is bounded** by a 3 s acquire timeout, and a circuit breaker skips storage
   entirely for 30 s after 2 *connectivity* failures. Query-level errors never trip it, so a bad
   query cannot disable storage.
@@ -393,13 +433,14 @@ and recovering after the 30 s breaker cooldown.
 ### Layout
 
 ```
-src/lib.rs                     library target: exposes config + db + prompts + resources + server
+src/lib.rs                     library target: exposes config + db + prompts + resources + server + sse
 src/config.rs                  layered configuration (defaults/file/env/flags)
 src/main.rs                    CLI, tracing, stdio/SSE wiring
 src/server.rs                  Calculator: ServerHandler, peer/subscriptions, page size
 src/prompts.rs                 the prompt catalogue, rendering and validation
 src/resources.rs               resource catalogue, URI routing, reads from the store
 src/db.rs                      all database access, dialects, migrations, circuit breaker
+src/sse.rs                     validating SSE transport (Host/Origin/token, bounded sessions)
 migrations/{postgres,mysql,sqlite}/  per-dialect sqlx migrations
 config.example.toml            documented example config (copy to config.toml)
 scripts/verify-backend.sh      manual end-to-end check against a live database
@@ -438,6 +479,8 @@ let calculator = Calculator::new(Store::from_settings(&config.storage));
   the third-party `sqlx-mssql` crate.
 - SQLite file databases stay in the rollback-journal mode SQLite defaults to. A history log written by
   several processes at once would want WAL, which the URL cannot currently request.
+- The SSE transport is plaintext HTTP with a header-only bearer token. Terminate TLS in a reverse
+  proxy, and note that a browser `EventSource` cannot set the `Authorization` header without one.
 
 ## License
 

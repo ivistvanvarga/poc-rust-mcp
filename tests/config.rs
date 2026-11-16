@@ -14,7 +14,7 @@ use std::{
 };
 
 use poc_rust_mcp::{
-    config::{Cli, Config, ConfigError, Env, MapEnv, StorageConfig, SystemEnv, env_keys},
+    config::{Cli, Config, ConfigError, Env, MapEnv, ServerConfig, StorageConfig, SystemEnv, env_keys},
     db::{Dialect, Limits, Store},
     server::clamp_history_limit,
 };
@@ -568,4 +568,88 @@ fn the_real_environment_is_readable_through_the_same_trait() {
 #[test]
 fn default_limits_match_an_empty_configuration() {
     assert_eq!(Limits::default(), Limits::from(&StorageConfig::default()));
+}
+
+#[test]
+fn sse_security_settings_layer_through_environment_and_file() {
+    let env = MapEnv::new()
+        .with("MCP_SSE_ALLOWED_HOSTS", "localhost:8000, 127.0.0.1")
+        .with("MCP_SSE_ALLOWED_ORIGINS", "https://ui.example")
+        .with("MCP_SSE_TOKEN", "s3cret")
+        .with("MCP_SSE_MAX_SESSIONS", "3");
+    let config = Config::resolve(
+        &Cli {
+            serve_sse: true,
+            ..Cli::default()
+        },
+        &env,
+    )
+    .expect("valid settings");
+    assert_eq!(
+        config.server.sse_allowed_hosts,
+        ["localhost:8000", "127.0.0.1"]
+    );
+    assert_eq!(config.server.sse_allowed_origins, ["https://ui.example"]);
+    assert_eq!(config.server.sse_token.as_ref().unwrap().expose(), "s3cret");
+    assert_eq!(config.server.sse_max_sessions, 3);
+    assert!(!format!("{:?}", config.server).contains("s3cret"));
+}
+
+#[test]
+fn sse_security_settings_come_from_the_file_layer_too() {
+    let file = TempFile::new(
+        "[server]\n\
+         sse_allowed_hosts = [\"mcp.example\"]\n\
+         sse_allowed_origins = [\"https://ui.example\"]\n\
+         sse_token = \"file-token\"\n\
+         sse_max_sessions = 7\n",
+    );
+    let config = Config::from_file(file.path()).expect("valid settings");
+    assert_eq!(config.server.sse_allowed_hosts, ["mcp.example"]);
+    assert_eq!(config.server.sse_allowed_origins, ["https://ui.example"]);
+    assert_eq!(
+        config.server.sse_token.as_ref().unwrap().expose(),
+        "file-token"
+    );
+    assert_eq!(config.server.sse_max_sessions, 7);
+}
+
+#[test]
+fn sse_security_settings_reject_malformed_values() {
+    for (key, value) in [
+        ("MCP_SSE_ALLOWED_HOSTS", "https://example.com"),
+        ("MCP_SSE_ALLOWED_HOSTS", "*"),
+        ("MCP_SSE_ALLOWED_HOSTS", "a,,b"),
+        ("MCP_SSE_ALLOWED_HOSTS", "example.com:0"),
+        ("MCP_SSE_ALLOWED_ORIGINS", "ftp://example.com"),
+        ("MCP_SSE_ALLOWED_ORIGINS", "https://example.com/path"),
+        ("MCP_SSE_ALLOWED_ORIGINS", "https://example.com?x=1"),
+        ("MCP_SSE_ALLOWED_ORIGINS", "*"),
+        ("MCP_SSE_ALLOWED_ORIGINS", "https://example.com:0"),
+        ("MCP_SSE_MAX_SESSIONS", "0"),
+    ] {
+        let env = MapEnv::new().with(key, value);
+        assert!(
+            Config::resolve(&Cli::default(), &env).is_err(),
+            "{key}={value} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn a_blank_sse_token_is_rejected_in_the_file_layer() {
+    let file = TempFile::new("[server]\nsse_token = \"   \"\n");
+    assert!(
+        Config::from_file(file.path()).is_err(),
+        "a blank token is not a token"
+    );
+}
+
+#[test]
+fn loopback_sse_needs_no_security_settings() {
+    let config = ServerConfig::default();
+    assert!(config.sse_allowed_hosts.is_empty());
+    assert!(config.sse_allowed_origins.is_empty());
+    assert!(config.sse_token.is_none());
+    assert!(config.sse_address.ip().is_loopback());
 }

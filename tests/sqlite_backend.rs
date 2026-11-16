@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use poc_rust_mcp::db::{Dialect, Store};
+use poc_rust_mcp::db::{Dialect, Limits, Store};
 
 /// Generous ceiling for a background write to land. SQLite is in-process, so this is only ever hit
 /// if something actually blocks.
@@ -93,6 +93,18 @@ async fn wait_for_history(
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// Poll `status` for the stored row count, which `list` cannot report: the read is clamped to the
+/// same cap that pruning enforces, so it would look satisfied before pruning has run.
+async fn stored_row_count(store: &Store) -> i64 {
+    let status = store.status().await.expect("sqlite should answer");
+    status
+        .split(", ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|rows| rows.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected status line: {status}"))
 }
 
 #[tokio::test]
@@ -184,6 +196,116 @@ async fn history_comes_back_newest_first_and_honours_the_limit() {
         ids, descending,
         "auto-incrementing ids must descend with the rows"
     );
+}
+
+#[tokio::test]
+async fn history_is_pruned_to_the_configured_row_cap() {
+    let store = Store::connect_with_limits(
+        IN_MEMORY,
+        Limits {
+            max_history_rows: 5,
+            ..Limits::default()
+        },
+    );
+    for index in 0..9 {
+        store.record_success("add", serde_json::json!({ "index": index }), &index.to_string());
+        // Wait for this write to land before starting the next one, so `created_at` order matches
+        // the order they were recorded in. `wait_for_history` cannot be used here: the read is
+        // clamped to the same cap, so it would report success before pruning has run.
+        let expected = (index + 1).min(5);
+        let deadline = Instant::now() + WRITE_TIMEOUT;
+        loop {
+            let count = stored_row_count(&store).await;
+            if count == expected {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected {expected} stored rows, found {count}"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+    let entries = wait_for_history(&store, |entries| entries.len() == 5).await;
+    let results: Vec<&str> = entries.iter().filter_map(|e| e.result.as_deref()).collect();
+    assert_eq!(results, ["8", "7", "6", "5", "4"], "only the newest survive");
+    // A direct oversized read cannot escape the cap either.
+    let clamped = store.list(1000).await.expect("listing should succeed");
+    assert_eq!(clamped.len(), 5);
+    // Zero and negative limits clamp to one row, not to "unlimited".
+    assert_eq!(store.list(0).await.expect("listing").len(), 1);
+    assert_eq!(store.list(-5).await.expect("listing").len(), 1);
+}
+
+#[tokio::test]
+async fn history_is_pruned_to_the_configured_row_cap_when_writes_are_concurrent() {
+    // The same guarantee when the writes race: pruning must keep the table bounded regardless of
+    // scheduling, even though which rows survive is then unspecified.
+    let store = Store::connect_with_limits(
+        IN_MEMORY,
+        Limits {
+            max_history_rows: 3,
+            ..Limits::default()
+        },
+    );
+    for index in 0..12 {
+        store.record_success("add", serde_json::json!({ "index": index }), &index.to_string());
+    }
+    let deadline = Instant::now() + WRITE_TIMEOUT;
+    loop {
+        let count = stored_row_count(&store).await;
+        if count == 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a bounded table must settle at 3 rows, found {count}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    assert_eq!(store.list(1000).await.expect("listing").len(), 3);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_new_sqlite_file_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = TempDb::new();
+    let store = Store::connect(&path.url());
+    store.status().await.expect("the database should be usable");
+    let mode = std::fs::metadata(path.path())
+        .expect("the file should exist")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "new history files must not be group/world readable"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn existing_sqlite_file_permissions_are_left_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = TempDb::new();
+    std::fs::write(path.path(), b"").expect("create the file");
+    std::fs::set_permissions(path.path(), std::fs::Permissions::from_mode(0o644))
+        .expect("set a shared mode");
+    let store = Store::connect(&path.url());
+    store.status().await.expect("the database should be usable");
+    let mode = std::fs::metadata(path.path())
+        .expect("the file should exist")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o644, "an existing file must keep its mode");
+}
+
+#[tokio::test]
+async fn an_uncreatable_sqlite_path_degrades_to_disabled_storage() {
+    let store = Store::connect("sqlite:///definitely/missing/poc-rust-mcp/db.sqlite");
+    assert!(!store.is_configured(), "a bad path must not look healthy");
 }
 
 #[tokio::test]

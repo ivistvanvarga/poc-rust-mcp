@@ -3,3 +3,4 @@
 # Local config: copy config.example.toml to config.toml and edit. The example is committed, a
 # real config is machine-specific and may contain credentials.
 /config.toml
+Cargo.lock

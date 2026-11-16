@@ -7,10 +7,8 @@ use poc_rust_mcp::{
     db::{Dialect, Store},
     server::Calculator,
 };
-use rmcp::{
-    ServiceExt,
-    transport::{sse_server::SseServer, stdio},
-};
+use rmcp::{ServiceExt, transport::stdio};
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -75,23 +73,42 @@ async fn serve_stdio(server: &ServerConfig, store: Store) -> Result<()> {
 }
 
 async fn serve_sse(server: &ServerConfig, store: Store) -> Result<()> {
-    let addr = server.sse_address;
     let storage = store.dialect().map_or("disabled", Dialect::label);
+    let settings = poc_rust_mcp::sse::Settings::from_config(server)?;
+    let token_required = settings.requires_token();
+    let listener = tokio::net::TcpListener::bind(server.sse_address)
+        .await
+        .with_context(|| format!("failed to bind SSE server to {}", server.sse_address))?;
+    let addr = listener
+        .local_addr()
+        .context("cannot read the SSE listener address")?;
+    let cancel = CancellationToken::new();
+    let signal = cancel.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal.cancel();
+        }
+    });
     let page_size = server.list_page_size;
-    let cancel = SseServer::serve(addr)
-        .await
-        .with_context(|| format!("failed to bind SSE server to {addr}"))?
-        // A fresh `Calculator` per session, so each client's subscriptions and log level stay its
-        // own: rmcp installs that session's peer on it.
-        .with_service(move || Calculator::with_list_page_size(store.clone(), page_size));
-    tracing::info!(%addr, storage, sse_path = "/sse", post_path = "/message", "sse server ready");
+    tracing::info!(
+        %addr,
+        storage,
+        token_required,
+        sse_path = "/sse",
+        post_path = "/message",
+        "sse server ready"
+    );
 
-    tokio::signal::ctrl_c()
-        .await
-        .context("failed to listen for ctrl-c")?;
-    tracing::info!("shutting down");
-    cancel.cancel();
-    Ok(())
+    // A fresh `Calculator` per session, so each client's subscriptions and log level stay its own:
+    // rmcp installs that session's peer on it.
+    poc_rust_mcp::sse::serve(
+        listener,
+        settings,
+        move || Calculator::with_list_page_size(store.clone(), page_size),
+        cancel,
+    )
+    .await
+    .context("SSE server failed")
 }
 
 /// The one place a [`Calculator`] is built, so the page size is never forgotten on one transport.

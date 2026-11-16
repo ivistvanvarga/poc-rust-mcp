@@ -26,6 +26,27 @@
 # Default: 20
 # list_page_size = 20
 
+# Host values the SSE transport accepts, as `host` or `host:port`. A value without a port matches any
+# port on that host; a value with a port is pinned to it. A loopback listener needs none (it trusts
+# local processes); any other listener requires a non-empty list. Overridden by
+# MCP_SSE_ALLOWED_HOSTS (comma-separated).
+# sse_allowed_hosts = ["mcp.example", "127.0.0.1:8000"]
+
+# Browser origins the SSE transport accepts, e.g. `https://ui.example`. Restriction only: matching
+# requests are allowed, but no CORS headers are ever emitted and preflights are not answered. An
+# omitted list accepts any Origin whose host matches the request's Host; set it to require an exact
+# scheme/host/port match. Overridden by MCP_SSE_ALLOWED_ORIGINS (comma-separated).
+# sse_allowed_origins = ["https://ui.example"]
+
+# Bearer token required on every SSE request. Header-only: `Authorization: Bearer <token>`. There is
+# deliberately no CLI flag, because a command line is visible in `ps` and shell history. Required for
+# any non-loopback listener. Overridden by MCP_SSE_TOKEN.
+# sse_token = "change-me"
+
+# Maximum simultaneous SSE sessions. Must be at least 1. Overridden by MCP_SSE_MAX_SESSIONS.
+# Default: 64
+# sse_max_sessions = 64
+
 [storage]
 # Database URL. Leave unset (or blank) to disable storage: the server still starts and every
 # arithmetic tool still works, while the three history tools report that storage is off.
@@ -57,6 +78,7 @@
 # How long storage stays skipped once the breaker opens. Must be greater than 0. Default: 30000
 # breaker_cooldown_ms = 30000
 
-# Upper bound on rows `calc_history` returns; a client-supplied limit is clamped into 1..=this.
+# Upper bound on stored history rows *and* on what `calc_history` returns: the table is pruned to
+# the newest N rows after every insert, and a client-supplied limit is clamped into 1..=this.
 # Must be at least 1. Default: 100
 # max_history_rows = 100

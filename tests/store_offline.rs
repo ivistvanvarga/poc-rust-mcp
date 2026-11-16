@@ -154,6 +154,20 @@ fn history_limit_is_clamped_to_the_configured_maximum() {
 }
 
 #[tokio::test]
+async fn client_facing_errors_never_echo_the_url_or_driver_text() {
+    let store = Store::connect_with_timeout("postgres://mcp:supersecret@127.0.0.1:1/mcp", FAST);
+    let error = store.status().await.expect_err("the database is down");
+    assert!(!error.contains("supersecret"), "{error}");
+    assert!(!error.contains("127.0.0.1"), "{error}");
+    assert!(!error.contains("connection refused"), "{error}");
+    assert!(!error.contains("sqlx"), "{error}");
+    assert!(
+        error.contains("database unreachable") || error.contains("migration failed"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn recording_history_is_fire_and_forget() {
     let mut stores = vec![Store::disabled()];
     stores.extend(DEAD_URLS.map(|url| Store::connect_with_timeout(url, FAST)));

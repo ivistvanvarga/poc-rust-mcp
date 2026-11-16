@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 use std::{
+    path::Path,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -13,7 +17,7 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 use tracing::{debug, warn};
 
 use crate::config::StorageConfig;
@@ -31,6 +35,14 @@ static POSTGRES_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/postgres");
 static MYSQL_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/mysql");
 static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/sqlite");
 
+/// Upper bound on detached history writes in flight at once.
+///
+/// Writes are fire-and-forget, so a caller can enqueue them faster than a degraded database drains
+/// them. Without a bound the spawned tasks accumulate without limit; with one, an excess record is
+/// dropped (history is best-effort by design) rather than growing the process or blocking the tool
+/// call that produced it.
+pub const MAX_PENDING_WRITES: usize = 64;
+
 /// Whether a sqlx error means "the database is unreachable" as opposed to "the query was bad".
 /// Only the former should trip the breaker; a bad query must not disable storage.
 const fn is_connectivity_error(error: &sqlx::Error) -> bool {
@@ -42,6 +54,37 @@ const fn is_connectivity_error(error: &sqlx::Error) -> bool {
             | sqlx::Error::Configuration(_)
             | sqlx::Error::Tls(_)
     )
+}
+
+/// A client-facing category for a storage failure.
+///
+/// Tool results and MCP errors are visible to whoever is connected, and a raw `sqlx::Error` can
+/// name the host, the driver, the SQL, or a password embedded in the connection string. The full
+/// error still reaches `tracing` through [`Store::finish`]; the client gets only this category.
+const fn describe_storage_error(error: &sqlx::Error) -> &'static str {
+    if is_connectivity_error(error) {
+        "database unreachable"
+    } else if matches!(error, sqlx::Error::Database(_)) {
+        "database rejected the request"
+    } else {
+        "internal storage error"
+    }
+}
+
+/// A client-facing category for a migration failure, for the same reason as
+/// [`describe_storage_error`]: `MigrateError` embeds the driver error, which can name the host.
+const fn describe_migration_error(error: &sqlx::migrate::MigrateError) -> &'static str {
+    use sqlx::migrate::MigrateError;
+    match error {
+        MigrateError::VersionMismatch(_) => "migration checksum mismatch",
+        MigrateError::VersionMissing(_)
+        | MigrateError::VersionTooOld(_, _)
+        | MigrateError::VersionTooNew(_, _)
+        | MigrateError::VersionNotPresent(_) => {
+            "migration history does not match the embedded migrations"
+        }
+        _ => "migration failed",
+    }
 }
 
 /// A single recorded calculator call, as returned to MCP clients.
@@ -118,6 +161,32 @@ impl From<&StorageConfig> for Limits {
     }
 }
 
+/// Keep the scheme, authority host and path; replace userinfo and drop the query/fragment.
+///
+/// Database URLs carry passwords in their userinfo (and sometimes in query parameters such as
+/// `?password=`), so neither may reach a log line or a client-facing error verbatim. The host and
+/// path are kept because "which database is this?" is the question the log had to answer.
+#[must_use]
+pub fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "<redacted>".to_owned();
+    };
+    if scheme.is_empty() {
+        return "<redacted>".to_owned();
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let path = rest[authority_end..]
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let userinfo = if authority.contains('@') { "***@" } else { "" };
+    format!("{scheme}://{userinfo}{host}{path}")
+}
+
 /// Which database [`Store`] talks to, decided by the URL's scheme.
 ///
 /// These are the three drivers `sqlx` 0.8 implements itself. Each one carries its own SQL dialect
@@ -161,7 +230,7 @@ impl Dialect {
         let Some((scheme, _)) = url.split_once(':') else {
             return Err(format!(
                 "expected a database URL starting with one of {}: (for example \
-                 postgres://mcp:mcp@127.0.0.1:5432/mcp), found {url:?}",
+                 postgres://mcp:mcp@127.0.0.1:5432/mcp)",
                 Self::SCHEMES.join(", ")
             ));
         };
@@ -241,6 +310,26 @@ impl Dialect {
         "DELETE FROM calc_history"
     }
 
+    /// Keep only the newest `max_history_rows` rows.
+    ///
+    /// MySQL will not accept a subquery over the table being deleted from in `NOT IN`, so it gets a
+    /// derived-table join instead; the other two accept the portable form.
+    fn prune_sql(self) -> String {
+        let keep = format!(
+            "SELECT id FROM calc_history ORDER BY created_at DESC, id DESC LIMIT {}",
+            self.placeholder(1)
+        );
+        match self {
+            Self::Postgres | Self::Sqlite => {
+                format!("DELETE FROM calc_history WHERE id NOT IN ({keep})")
+            }
+            Self::MySql => format!(
+                "DELETE h FROM calc_history h LEFT JOIN ({keep}) keep ON h.id = keep.id \
+                 WHERE keep.id IS NULL"
+            ),
+        }
+    }
+
     fn count_sql(self) -> &'static str {
         "SELECT count(*) FROM calc_history"
     }
@@ -280,7 +369,8 @@ impl Pool {
     fn connect(url: &str, dialect: Dialect, limits: Limits) -> Result<Self, String> {
         match dialect {
             Dialect::Postgres => {
-                let options = PgConnectOptions::from_str(url).map_err(|error| error.to_string())?;
+                let options = PgConnectOptions::from_str(url)
+                    .map_err(|_| "database URL is not valid for the postgres backend".to_owned())?;
                 Ok(Self::Postgres(
                     PgPoolOptions::new()
                         .max_connections(limits.max_connections)
@@ -289,8 +379,8 @@ impl Pool {
                 ))
             }
             Dialect::MySql => {
-                let options =
-                    MySqlConnectOptions::from_str(url).map_err(|error| error.to_string())?;
+                let options = MySqlConnectOptions::from_str(url)
+                    .map_err(|_| "database URL is not valid for the mysql backend".to_owned())?;
                 Ok(Self::MySql(
                     MySqlPoolOptions::new()
                         .max_connections(limits.max_connections)
@@ -300,8 +390,11 @@ impl Pool {
             }
             Dialect::Sqlite => {
                 let (database, params) = sqlite_url_parts(url);
-                let mut options =
-                    SqliteConnectOptions::from_str(url).map_err(|error| error.to_string())?;
+                let mut options = SqliteConnectOptions::from_str(url)
+                    .map_err(|_| "database URL is not valid for the sqlite backend".to_owned())?;
+                // Create the file ourselves first, so a new history database is owner-only rather
+                // than inheriting the process umask (usually 0644). An existing file is left alone.
+                prepare_sqlite_file(database, params, options.get_filename())?;
                 // Create the file if it is missing, so `sqlite://mcp.db` works on a fresh checkout.
                 // A URL pinned to `mode=ro`/`mode=rw` means "this file must already exist".
                 if !matches!(sqlite_param(params, "mode"), Some("ro" | "rw")) {
@@ -376,6 +469,44 @@ fn sqlite_is_in_memory(database: &str, params: Option<&str>) -> bool {
     database == ":memory:" || matches!(sqlite_param(params, "mode"), Some("memory"))
 }
 
+/// Create a missing SQLite history file with owner-only permissions, and never touch an existing one.
+///
+/// `create_if_missing(true)` would create the file with the process umask, which is commonly `0644`;
+/// the history contains every calculation a client sent. An operator who already has a file keeps
+/// whatever mode they chose — a silent `chmod` on connect would be a surprise, and this process may
+/// not be the file's owner.
+fn prepare_sqlite_file(
+    database: &str,
+    params: Option<&str>,
+    path: &Path,
+) -> Result<(), String> {
+    if sqlite_is_in_memory(database, params)
+        || matches!(sqlite_param(params, "mode"), Some("ro" | "rw"))
+    {
+        return Ok(());
+    }
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    match open.open(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
+                Ok(())
+            } else {
+                Err("sqlite database path exists but is not a regular file".to_owned())
+            }
+        }
+        // The path is deliberately absent: it is operator-supplied and may itself be sensitive,
+        // and the caller logs the URL (redacted) already.
+        Err(_) => Err("cannot create the sqlite database file".to_owned()),
+    }
+}
+
 /// Optional database-backed storage for calculator history.
 ///
 /// A `Store` is always constructible: when no usable URL is configured the backend is `None` and
@@ -392,6 +523,10 @@ pub struct Store {
     backend: Option<Pool>,
     schema: Arc<OnceCell<()>>,
     breaker: Arc<Mutex<Breaker>>,
+    /// Limits the number of detached inserts in flight; see [`MAX_PENDING_WRITES`].
+    writes: Arc<Semaphore>,
+    /// Records dropped because every write slot was taken, for tests and diagnosis.
+    dropped: Arc<AtomicUsize>,
     limits: Limits,
 }
 
@@ -465,7 +600,11 @@ impl Store {
         match Self::try_connect(url, limits) {
             Ok(store) => store,
             Err(error) => {
-                warn!(%error, "unusable database URL; serving calculator tools without history");
+                warn!(
+                    url = %redact_url(url),
+                    error = %error,
+                    "unusable database URL; serving calculator tools without history"
+                );
                 Self::with_backend(None, limits)
             }
         }
@@ -487,6 +626,8 @@ impl Store {
             // `version`.
             schema: Arc::new(OnceCell::const_new()),
             breaker: Arc::default(),
+            writes: Arc::new(Semaphore::new(MAX_PENDING_WRITES)),
+            dropped: Arc::default(),
             limits,
         }
     }
@@ -569,7 +710,8 @@ impl Store {
             }
             Err(error) => {
                 self.note_failure(&error);
-                Err(format!("{context}: {error}"))
+                warn!(%error, %context, "storage operation failed");
+                Err(format!("{context}: {}", describe_storage_error(&error)))
             }
         }
     }
@@ -601,7 +743,11 @@ impl Store {
                             }
                             _ => {}
                         }
-                        Err(format!("failed to apply migrations: {error}"))
+                        warn!(%error, dialect = dialect.label(), "database migration failed");
+                        Err(format!(
+                            "failed to apply migrations: {}",
+                            describe_migration_error(&error)
+                        ))
                     }
                 }
             })
@@ -633,7 +779,13 @@ impl Store {
     ) {
         let store = self.clone();
         let operation = operation.to_owned();
+        let Ok(permit) = self.writes.clone().try_acquire_owned() else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            debug!(%operation, "history write dropped: too many pending writes");
+            return;
+        };
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(insert_error) = store.insert(&operation, inputs, result, error).await {
                 debug!(
                     %insert_error,
@@ -658,7 +810,9 @@ impl Store {
         // `()` as the normalised result: an insert's row count is not interesting, but the three
         // `QueryResult` types are not the same type, so the arms need a common one.
         let executed = with_pool!(backend, |pool| {
-            sqlx::query(&sql)
+            // The text is assembled from static fragments and bind placeholders only — no user
+            // input is ever interpolated — so the audit sqlx asks for is satisfied above.
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(operation)
                 .bind(inputs)
                 .bind(result)
@@ -668,15 +822,40 @@ impl Store {
                 .await
                 .map(|_| ())
         });
-        self.finish(executed, "failed to insert history")
+        self.finish(executed, "failed to insert history")?;
+        if let Err(prune_error) = self.prune(&backend).await {
+            debug!(%prune_error, "history pruning failed; the insert still succeeded");
+        }
+        Ok(())
     }
 
-    /// Most recent entries first.
+    /// Delete everything but the newest [`Limits::max_history_rows`] rows.
+    ///
+    /// The cap is the same setting `calc_history` uses for its read limit, so the tool's promise
+    /// ("the newest N") and what the database keeps cannot drift apart.
+    async fn prune(&self, backend: &Pool) -> Result<(), String> {
+        let sql = backend.dialect().prune_sql();
+        let executed = with_pool!(backend, |pool| {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(self.limits.max_history_rows)
+                .execute(pool)
+                .await
+                .map(|_| ())
+        });
+        self.finish(executed, "failed to prune history")
+    }
+
+    /// Most recent entries first, at most [`Limits::max_history_rows`] rows.
+    ///
+    /// The argument is clamped even though the tool already clamps it: `Store` is a public API, and
+    /// SQLite treats a negative `LIMIT` as "unlimited", so an unclamped value here would be a way
+    /// around the configured cap.
     pub async fn list(&self, limit: i64) -> Result<Vec<HistoryEntry>, String> {
+        let limit = limit.clamp(1, self.limits.max_history_rows.max(1));
         let backend = self.ensure_schema().await?;
         let sql = backend.dialect().list_sql();
         let fetched = with_pool!(backend, |pool| {
-            sqlx::query_as::<_, HistoryEntry>(&sql)
+            sqlx::query_as::<_, HistoryEntry>(sqlx::AssertSqlSafe(sql))
                 .bind(limit)
                 .fetch_all(pool)
                 .await
@@ -728,9 +907,13 @@ impl Store {
 #[doc(hidden)]
 pub mod testing {
     use super::{
-        Dialect, Migrator, POSTGRES_MIGRATIONS, Store, sqlite_is_in_memory as parse_in_memory,
-        sqlite_param as parse_param, sqlite_url_parts as parse_url_parts,
+        Dialect, Migrator, POSTGRES_MIGRATIONS, Store,
+        sqlite_is_in_memory as parse_in_memory, sqlite_param as parse_param,
+        sqlite_url_parts as parse_url_parts,
     };
+
+    /// See the public [`super::redact_url`].
+    pub use super::redact_url;
 
     /// Count a failure as the breaker sees it, without needing a real database.
     pub fn note_failure(store: &Store, error: &sqlx::Error) {
@@ -776,6 +959,11 @@ pub mod testing {
         dialect.list_sql()
     }
 
+    /// The retention `DELETE` a backend would send, placeholders included.
+    pub fn prune_sql(dialect: Dialect) -> String {
+        dialect.prune_sql()
+    }
+
     /// The migrations a backend would apply.
     pub fn migrations(dialect: Dialect) -> &'static Migrator {
         dialect.migrations()
@@ -789,7 +977,7 @@ pub mod testing {
         POSTGRES_MIGRATIONS
             .iter()
             .next()
-            .map(|migration| migration.sql.to_string())
+            .map(|migration| migration.sql.as_str().to_owned())
     }
 
     /// See the private `sqlite_url_parts`, which this mirrors.
@@ -805,5 +993,21 @@ pub mod testing {
     /// See the private `sqlite_is_in_memory`, which this mirrors.
     pub fn sqlite_is_in_memory(database: &str, params: Option<&str>) -> bool {
         parse_in_memory(database, params)
+    }
+
+    /// Take every pending-write permit, so the next write has nowhere to go.
+    pub fn take_write_permits(store: &Store) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let mut permits = Vec::new();
+        while let Ok(permit) = store.writes.clone().try_acquire_owned() {
+            permits.push(permit);
+        }
+        permits
+    }
+
+    /// How many records were dropped because every write slot was taken.
+    pub fn dropped_writes(store: &Store) -> usize {
+        store
+            .dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }

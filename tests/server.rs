@@ -317,6 +317,42 @@ async fn subscribing_is_refused_for_a_resource_this_server_does_not_serve() {
 }
 
 #[tokio::test]
+async fn subscriptions_are_capped_per_client() {
+    let calculator = Calculator::new(Store::disabled()).with_subscription_limit(2);
+    for uri in [resources::HISTORY_URI, "calc://history/1"] {
+        calculator
+            .subscribe(
+                SubscribeRequestParam {
+                    uri: uri.to_owned(),
+                },
+                request_context(),
+            )
+            .await
+            .expect("within the cap");
+    }
+    // Re-subscribing to the same URI is free.
+    calculator
+        .subscribe(
+            SubscribeRequestParam {
+                uri: resources::HISTORY_URI.to_owned(),
+            },
+            request_context(),
+        )
+        .await
+        .expect("duplicate subscription");
+    let error = calculator
+        .subscribe(
+            SubscribeRequestParam {
+                uri: "calc://history/2".to_owned(),
+            },
+            request_context(),
+        )
+        .await
+        .expect_err("cap exceeded");
+    assert!(error.message.contains("too many"), "{error}");
+}
+
+#[tokio::test]
 async fn unsubscribing_something_never_subscribed_is_not_an_error() {
     calculator()
         .unsubscribe(

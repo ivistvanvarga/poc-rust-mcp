@@ -7,7 +7,8 @@ Crate `poc-rust-mcp` (edition 2024) with **both** a lib and a bin target:
 - `src/lib.rs` — exposes `pub mod config`, `db`, `prompts`, `resources` and `server`, so every test in
   `tests/` can drive the server's public surface directly.
 - `src/main.rs` — thin transport wiring (tracing, stdio/SSE), imports the lib rather than declaring
-  `mod` items itself; all argument parsing lives in `config`.
+  `mod` items itself; all argument parsing lives in `config`. `main.rs::calculator` is the only place
+  a `Calculator` is built, so a new server setting must be threaded through there for both transports.
 - `src/config.rs` — layered configuration, `src/server.rs` — the `Calculator`: tools, `ServerHandler`,
   peer/subscriptions/log level/page size. `src/prompts.rs` — the prompt catalogue.
   `src/resources.rs` — resource catalogue, URI routing, reads from the store.
@@ -176,7 +177,8 @@ Ties are real (both defaults have second resolution), which is why the query is
 ### SQLite specifics worth knowing
 
 - `SqliteConnectOptions` exposes no getter for "in-memory" or "read-only", so `sqlite_url_parts` /
-  `sqlite_param` re-parse the URL exactly as sqlx does. Both are unit-tested in `db.rs`.
+  `sqlite_param` re-parse the URL exactly as sqlx does. Both are covered through `db::testing` in
+  `tests/db.rs`.
 - An **in-memory** store is forced to `max_connections(1)`. SQLite's shared-cache mode takes
   *table*-level locks that `busy_timeout` cannot wait out, so a larger pool turns a contended write
   into a failed one. A *file* store keeps the configured pool size — which also means the migration
@@ -205,7 +207,7 @@ cell the detached task ran its *own* migration alongside the caller's. PostgreSQ
 empty `_sqlx_migrations` and the loser failed with `UNIQUE constraint failed: _sqlx_migrations.version`
 — surfacing as a silently dropped history row.
 
-`db::tests::clones_share_one_schema_cell` guards it, and it clones *before* the first migration on
+`tests/db.rs::clones_share_one_schema_cell` guards it, and it clones *before* the first migration on
 purpose: a clone taken afterwards copies the value and passes either way. Keep the `Arc` for the same
 reason `breaker` has one.
 
@@ -344,13 +346,23 @@ podman-compose -f .devcontainer/compose.yaml down -v     # -v also drops the pgd
 - The compose `app` service sets `DATABASE_URL` for `db`, which still works: it is an env-layer key
   with no config file involved. Edit that one value to point at `mysql://mcp:mcp@mysql:3306/mcp`.
 - `rust-toolchain.toml` pins `stable`, so the container rustup-downloads the current stable on
-  first use even though the image ships 1.98.1. Version drift between host and container is
+  first use even though the image ships Rust 1.98. Version drift between host and container is
   expected; both build clean.
 
 ## Tests
 
 **Every test lives in `tests/`. There is no `#[cfg(test)]` module in `src/`** — do not add one back.
 Each file is one layer, and each assertion lives in exactly one of them; do not duplicate.
+
+Run one layer or one test without paying for the whole suite:
+
+```bash
+cargo test --test server                         # one test binary
+cargo test --test mcp_features pages_without_gaps # substring filter within a binary
+cargo test --test sqlite_backend                 # the only layer needing a real database
+```
+
+The protocol-level files spawn the compiled binary, so `cargo test` builds the bin too.
 
 - `tests/stdio_protocol.rs` spawns the **real binary** over stdio and speaks raw JSON-RPC. Protocol
   mechanics: capabilities (and the ones deliberately *not* advertised), `ping`, `tools/list`, argument
@@ -452,3 +464,12 @@ No CI, no `[lints]` table — clippy defaults only, so `-D warnings` must pass c
   next storage call with `VersionMismatch`. `tests/db.rs` pins the shipped file against the migrator's
   embedded copy for exactly this reason. A licence header in a migration would cost more than it is
   worth; the repository's `LICENSE` covers those files anyway.
+- `Cargo.lock` is **committed**. `.gitignore` contains only `/target` and `/config.toml`; commit the
+  lockfile whenever deps change.
+- **Licensing: BSD 2-Clause, and `LICENSE` is the authoritative copy.** There are no per-file
+  headers, which is the usual Rust convention — do not add one without being asked. Three places
+  mention the licence and must agree: the SPDX identifier `license = "BSD-2-Clause"` in
+  `Cargo.toml`, the header in `LICENSE`, and the `## License` section in `README.md`. The `LICENSE`
+  text is the SPDX `BSD-2-Clause` template verbatim with only the year and copyright holder
+  substituted, so do not reflow it; if the variant ever changes to 3-Clause (which adds a
+  non-endorsement clause), change all three and replace the file with the SPDX `BSD-3-Clause` text.

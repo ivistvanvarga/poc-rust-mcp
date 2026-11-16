@@ -128,7 +128,10 @@ impl Settings {
             configured_addr: config.sse_address,
             allowed_hosts,
             allowed_origins,
-            token: config.sse_token.as_ref().map(|token| token.expose().to_owned()),
+            token: config
+                .sse_token
+                .as_ref()
+                .map(|token| token.expose().to_owned()),
             max_sessions: config.sse_max_sessions,
             keep_alive: DEFAULT_KEEP_ALIVE,
         };
@@ -336,9 +339,7 @@ impl Sink<TxJsonRpcMessage<RoleServer>> for SseTransport {
     type Error = io::Error;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.sink
-            .poll_ready_unpin(cx)
-            .map_err(io::Error::other)
+        self.sink.poll_ready_unpin(cx).map_err(io::Error::other)
     }
 
     fn start_send(
@@ -367,6 +368,10 @@ impl Stream for SseTransport {
 
 /// Reject a request that is not for an allowlisted host, does not come from an allowed origin, or
 /// does not carry the configured token.
+///
+/// The `Err` is a whole `Response` because that is what axum's `from_fn` middleware contract asks
+/// for; the box the lint suggests would only be unboxed again by the framework.
+#[allow(clippy::result_large_err)]
 async fn authorize<F, S>(
     State(app): State<App<F, S>>,
     request: Request<Body>,
@@ -407,6 +412,9 @@ fn forbidden(reason: &'static str) -> Response {
     (StatusCode::FORBIDDEN, reason).into_response()
 }
 
+/// Open a session, register it, and stream its events. The `Err` is a whole `Response` for the same
+/// reason as [`authorize`].
+#[allow(clippy::result_large_err)]
 async fn sse_handler<F, S>(
     State(app): State<App<F, S>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, io::Error>>>, Response>
@@ -417,7 +425,11 @@ where
     let id = match session_id() {
         Ok(id) => id,
         Err(()) => {
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, "cannot generate a session").into_response());
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "cannot generate a session",
+            )
+                .into_response());
         }
     };
     let cancel = CancellationToken::new();
@@ -571,17 +583,14 @@ fn normalize_authority(authority: &Authority) -> Option<(String, Option<u16>)> {
     if authority.as_str().contains('@') || authority.port_u16() == Some(0) {
         return None;
     }
-    Some((
-        normalize_host(authority.host())?,
-        authority.port_u16(),
-    ))
+    Some((normalize_host(authority.host())?, authority.port_u16()))
 }
 
 /// An allowlisted entry without a port matches any port on that host; one with a port is pinned.
 fn host_allowed(patterns: &[HostPattern], host: &str, port: Option<u16>) -> bool {
-    patterns
-        .iter()
-        .any(|pattern| pattern.host == host && pattern.port.is_none_or(|pinned| Some(pinned) == port))
+    patterns.iter().any(|pattern| {
+        pattern.host == host && pattern.port.is_none_or(|pinned| Some(pinned) == port)
+    })
 }
 
 /// Parse an `Origin` into `(scheme, host, effective_port)`.
@@ -630,9 +639,7 @@ fn origin_allowed(
                 && pattern.host == origin_host
                 && pattern.port.is_none_or(|pinned| pinned == origin_port)
         }),
-        None => {
-            origin_host == host && port.is_none_or(|request_port| request_port == origin_port)
-        }
+        None => origin_host == host && port.is_none_or(|request_port| request_port == origin_port),
     }
 }
 
@@ -640,16 +647,18 @@ fn origin_allowed(
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let mut difference = a.len() ^ b.len();
     for index in 0..a.len().max(b.len()) {
-        difference |= usize::from(
-            a.get(index).copied().unwrap_or(0) ^ b.get(index).copied().unwrap_or(0),
-        );
+        difference |=
+            usize::from(a.get(index).copied().unwrap_or(0) ^ b.get(index).copied().unwrap_or(0));
     }
     difference == 0
 }
 
 /// `Authorization: Bearer <token>`, header-only by design.
 fn bearer_allowed(expected: &str, headers: &HeaderMap) -> bool {
-    let Some(value) = headers.get(AUTHORIZATION).and_then(|value| value.to_str().ok()) else {
+    let Some(value) = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
         return false;
     };
     let Some((scheme, token)) = value.split_once(' ') else {

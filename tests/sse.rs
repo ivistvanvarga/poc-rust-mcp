@@ -233,8 +233,10 @@ fn non_loopback_binds_require_a_token_and_explicit_hosts() {
 
 #[test]
 fn settings_reject_malformed_allowlist_entries() {
-    let mut config = ServerConfig::default();
-    config.sse_allowed_hosts = vec!["*".to_owned()];
+    let mut config = ServerConfig {
+        sse_allowed_hosts: vec!["*".to_owned()],
+        ..ServerConfig::default()
+    };
     assert!(sse::Settings::from_config(&config).is_err());
     config.sse_allowed_hosts = vec!["mcp.example".to_owned()];
     config.sse_allowed_origins = vec!["https://mcp.example/path".to_owned()];
@@ -268,14 +270,22 @@ async fn foreign_host_and_origin_are_rejected() {
 
     let (status, _) = get_sse(server.addr, &good_host, None, None).await;
     assert_eq!(status, 200, "a request without Origin is a local client");
-    let (status, _) = get_sse(server.addr, &good_host, Some(&format!("http://{good_host}")), None).await;
+    let (status, _) = get_sse(
+        server.addr,
+        &good_host,
+        Some(&format!("http://{good_host}")),
+        None,
+    )
+    .await;
     assert_eq!(status, 200, "a same-origin browser request must pass");
 }
 
 #[tokio::test]
 async fn token_is_required_on_both_routes() {
-    let mut config = ServerConfig::default();
-    config.sse_token = Some(Secret::new("t0ken"));
+    let config = ServerConfig {
+        sse_token: Some(Secret::new("t0ken")),
+        ..ServerConfig::default()
+    };
     let server = start(config).await;
     let good_host = host(&server);
 
@@ -286,7 +296,8 @@ async fn token_is_required_on_both_routes() {
 
     // A well-formed notification, so the only thing under test is the token: a body that fails to
     // deserialize would be rejected with 400 before the session is ever looked up.
-    let notification = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }).to_string();
+    let notification =
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }).to_string();
     let status = post(
         server.addr,
         "/message?sessionId=whatever",
@@ -318,8 +329,10 @@ async fn token_is_required_on_both_routes() {
 
 #[tokio::test]
 async fn proxy_style_origin_matches_a_host_without_a_port() {
-    let mut config = ServerConfig::default();
-    config.sse_allowed_hosts = vec!["mcp.example".to_owned()];
+    let config = ServerConfig {
+        sse_allowed_hosts: vec!["mcp.example".to_owned()],
+        ..ServerConfig::default()
+    };
     let server = start(config).await;
 
     let (status, _) = get_sse(
@@ -346,8 +359,13 @@ async fn proxy_style_origin_matches_a_host_without_a_port() {
         "without a port in Host, the origin port is not compared"
     );
 
-    let (status, _) = get_sse(server.addr, "mcp.example:8443", Some("https://mcp.example"), None)
-        .await;
+    let (status, _) = get_sse(
+        server.addr,
+        "mcp.example:8443",
+        Some("https://mcp.example"),
+        None,
+    )
+    .await;
     assert_eq!(
         status, 403,
         "a pinned Host port makes the origin port significant"
@@ -381,7 +399,15 @@ async fn initialize_and_a_tool_call_work_over_the_event_stream() {
         }
     });
     assert_eq!(
-        post(server.addr, &post_path, &good_host, None, None, &initialize.to_string()).await,
+        post(
+            server.addr,
+            &post_path,
+            &good_host,
+            None,
+            None,
+            &initialize.to_string()
+        )
+        .await,
         202
     );
     let response = response_for(&mut events, 1).await;
@@ -393,7 +419,15 @@ async fn initialize_and_a_tool_call_work_over_the_event_stream() {
 
     let initialized = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
     assert_eq!(
-        post(server.addr, &post_path, &good_host, None, None, &initialized.to_string()).await,
+        post(
+            server.addr,
+            &post_path,
+            &good_host,
+            None,
+            None,
+            &initialized.to_string()
+        )
+        .await,
         202
     );
 
@@ -404,7 +438,15 @@ async fn initialize_and_a_tool_call_work_over_the_event_stream() {
         "params": { "name": "add", "arguments": { "a": 2, "b": 3 } }
     });
     assert_eq!(
-        post(server.addr, &post_path, &good_host, None, None, &call.to_string()).await,
+        post(
+            server.addr,
+            &post_path,
+            &good_host,
+            None,
+            None,
+            &call.to_string()
+        )
+        .await,
         202
     );
     let response = response_for(&mut events, 2).await;
@@ -416,8 +458,10 @@ async fn initialize_and_a_tool_call_work_over_the_event_stream() {
 
 #[tokio::test]
 async fn sessions_are_capped() {
-    let mut config = ServerConfig::default();
-    config.sse_max_sessions = 1;
+    let config = ServerConfig {
+        sse_max_sessions: 1,
+        ..ServerConfig::default()
+    };
     let server = start(config).await;
     let good_host = host(&server);
 
@@ -438,7 +482,8 @@ async fn a_disconnected_stream_releases_its_session() {
     let endpoint = data.expect("the endpoint event carries data");
     let session_id = endpoint
         .strip_prefix("/message?sessionId=")
-        .unwrap_or_else(|| panic!("unexpected endpoint {endpoint:?}")).to_owned();
+        .unwrap_or_else(|| panic!("unexpected endpoint {endpoint:?}"))
+        .to_owned();
     drop(events);
 
     let post_path = format!("/message?sessionId={session_id}");
@@ -475,7 +520,10 @@ async fn post_rejections_are_explicit() {
     let malformed = post(server.addr, &post_path, &good_host, None, None, "{not json").await;
     assert_eq!(malformed, 400, "malformed JSON is a client error");
 
-    let oversized = format!("{{\"jsonrpc\":\"2.0\",\"id\":1,\"padding\":\"{}\"}}", "x".repeat(300 * 1024));
+    let oversized = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"padding\":\"{}\"}}",
+        "x".repeat(300 * 1024)
+    );
     let status = post(server.addr, &post_path, &good_host, None, None, &oversized).await;
     assert_eq!(status, 413, "an oversized body is refused before parsing");
 }

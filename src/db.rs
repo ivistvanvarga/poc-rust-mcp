@@ -475,11 +475,7 @@ fn sqlite_is_in_memory(database: &str, params: Option<&str>) -> bool {
 /// the history contains every calculation a client sent. An operator who already has a file keeps
 /// whatever mode they chose — a silent `chmod` on connect would be a surprise, and this process may
 /// not be the file's owner.
-fn prepare_sqlite_file(
-    database: &str,
-    params: Option<&str>,
-    path: &Path,
-) -> Result<(), String> {
+fn prepare_sqlite_file(database: &str, params: Option<&str>, path: &Path) -> Result<(), String> {
     if sqlite_is_in_memory(database, params)
         || matches!(sqlite_param(params, "mode"), Some("ro" | "rw"))
     {
@@ -823,7 +819,7 @@ impl Store {
                 .map(|_| ())
         });
         self.finish(executed, "failed to insert history")?;
-        if let Err(prune_error) = self.prune(&backend).await {
+        if let Err(prune_error) = self.prune(backend).await {
             debug!(%prune_error, "history pruning failed; the insert still succeeded");
         }
         Ok(())
@@ -907,9 +903,8 @@ impl Store {
 #[doc(hidden)]
 pub mod testing {
     use super::{
-        Dialect, Migrator, POSTGRES_MIGRATIONS, Store,
-        sqlite_is_in_memory as parse_in_memory, sqlite_param as parse_param,
-        sqlite_url_parts as parse_url_parts,
+        Dialect, Migrator, POSTGRES_MIGRATIONS, Store, sqlite_is_in_memory as parse_in_memory,
+        sqlite_param as parse_param, sqlite_url_parts as parse_url_parts,
     };
 
     /// See the public [`super::redact_url`].
@@ -1006,8 +1001,6 @@ pub mod testing {
 
     /// How many records were dropped because every write slot was taken.
     pub fn dropped_writes(store: &Store) -> usize {
-        store
-            .dropped
-            .load(std::sync::atomic::Ordering::Relaxed)
+        store.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 }

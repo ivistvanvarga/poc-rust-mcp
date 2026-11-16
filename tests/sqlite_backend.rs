@@ -208,7 +208,11 @@ async fn history_is_pruned_to_the_configured_row_cap() {
         },
     );
     for index in 0..9 {
-        store.record_success("add", serde_json::json!({ "index": index }), &index.to_string());
+        store.record_success(
+            "add",
+            serde_json::json!({ "index": index }),
+            &index.to_string(),
+        );
         // Wait for this write to land before starting the next one, so `created_at` order matches
         // the order they were recorded in. `wait_for_history` cannot be used here: the read is
         // clamped to the same cap, so it would report success before pruning has run.
@@ -228,7 +232,11 @@ async fn history_is_pruned_to_the_configured_row_cap() {
     }
     let entries = wait_for_history(&store, |entries| entries.len() == 5).await;
     let results: Vec<&str> = entries.iter().filter_map(|e| e.result.as_deref()).collect();
-    assert_eq!(results, ["8", "7", "6", "5", "4"], "only the newest survive");
+    assert_eq!(
+        results,
+        ["8", "7", "6", "5", "4"],
+        "only the newest survive"
+    );
     // A direct oversized read cannot escape the cap either.
     let clamped = store.list(1000).await.expect("listing should succeed");
     assert_eq!(clamped.len(), 5);
@@ -249,7 +257,11 @@ async fn history_is_pruned_to_the_configured_row_cap_when_writes_are_concurrent(
         },
     );
     for index in 0..12 {
-        store.record_success("add", serde_json::json!({ "index": index }), &index.to_string());
+        store.record_success(
+            "add",
+            serde_json::json!({ "index": index }),
+            &index.to_string(),
+        );
     }
     let deadline = Instant::now() + WRITE_TIMEOUT;
     loop {

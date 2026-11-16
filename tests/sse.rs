@@ -16,10 +16,12 @@ use poc_rust_mcp::{
     server::Calculator,
     sse,
 };
+use rmcp::model::ClientJsonRpcMessage;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
+    sync::mpsc,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -145,10 +147,36 @@ async fn post(
     token: Option<&str>,
     body: &str,
 ) -> u16 {
+    post_with_content_type(
+        addr,
+        path,
+        host,
+        origin,
+        token,
+        Some("application/json"),
+        body,
+    )
+    .await
+}
+
+/// Like [`post`], but the `Content-Type` is chosen by the caller: `None` omits the header.
+#[allow(clippy::too_many_arguments)]
+async fn post_with_content_type(
+    addr: SocketAddr,
+    path: &str,
+    host: &str,
+    origin: Option<&str>,
+    token: Option<&str>,
+    content_type: Option<&str>,
+    body: &str,
+) -> u16 {
     let mut request = format!(
-        "POST {path} HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+        "POST {path} HTTP/1.0\r\nHost: {host}\r\nContent-Length: {}\r\n",
         body.len()
     );
+    if let Some(content_type) = content_type {
+        request.push_str(&format!("Content-Type: {content_type}\r\n"));
+    }
     if let Some(origin) = origin {
         request.push_str(&format!("Origin: {origin}\r\n"));
     }
@@ -229,6 +257,30 @@ fn non_loopback_binds_require_a_token_and_explicit_hosts() {
     sse::Settings::from_config(&config).expect("token + hosts is enough");
 
     sse::Settings::from_config(&ServerConfig::default()).expect("loopback needs neither");
+}
+
+/// A `Host` header without a port names the default port of the scheme. This transport is plain
+/// HTTP, so that is 80: a loopback bind on :80 must accept `Host: localhost`, not answer 403.
+#[test]
+fn a_portless_host_names_the_default_http_port() {
+    let on_80 = vec!["localhost:80".to_owned()];
+    assert!(sse::testing::host_allowed(&on_80, "localhost", None));
+    assert!(sse::testing::host_allowed(&on_80, "localhost", Some(80)));
+    assert!(!sse::testing::host_allowed(&on_80, "localhost", Some(8000)));
+
+    let on_8000 = vec!["localhost:8000".to_owned()];
+    assert!(
+        !sse::testing::host_allowed(&on_8000, "localhost", None),
+        "a portless Host means :80, not the bound :8000"
+    );
+
+    let any_port = vec!["localhost".to_owned()];
+    assert!(sse::testing::host_allowed(&any_port, "localhost", None));
+    assert!(sse::testing::host_allowed(
+        &any_port,
+        "localhost",
+        Some(9000)
+    ));
 }
 
 #[test]
@@ -520,10 +572,55 @@ async fn post_rejections_are_explicit() {
     let malformed = post(server.addr, &post_path, &good_host, None, None, "{not json").await;
     assert_eq!(malformed, 400, "malformed JSON is a client error");
 
+    let wrong_type = post_with_content_type(
+        server.addr,
+        &post_path,
+        &good_host,
+        None,
+        None,
+        Some("text/plain"),
+        "{ }",
+    )
+    .await;
+    assert_eq!(wrong_type, 415, "a non-JSON content type is refused");
+
+    let no_type =
+        post_with_content_type(server.addr, &post_path, &good_host, None, None, None, "{ }").await;
+    assert_eq!(no_type, 415, "a missing content type is refused");
+
     let oversized = format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":1,\"padding\":\"{}\"}}",
         "x".repeat(300 * 1024)
     );
     let status = post(server.addr, &post_path, &good_host, None, None, &oversized).await;
     assert_eq!(status, 413, "an oversized body is refused before parsing");
+}
+
+/// The full-queue branch of the POST path is not reachable over the wire (the rmcp service drains
+/// the inbound queue as fast as the handler fills it), so the mapping itself is pinned here.
+#[test]
+fn a_full_session_queue_maps_to_429() {
+    let notification = || {
+        serde_json::from_value::<ClientJsonRpcMessage>(
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        )
+        .expect("a well-formed notification")
+    };
+
+    let (sender, receiver) = mpsc::channel(1);
+    assert_eq!(
+        sse::testing::try_send_status(&sender, notification()),
+        Ok(axum::http::StatusCode::ACCEPTED)
+    );
+    assert_eq!(
+        sse::testing::try_send_status(&sender, notification()),
+        Err(axum::http::StatusCode::TOO_MANY_REQUESTS),
+        "a full queue is backpressure, not a client error"
+    );
+    drop(receiver);
+    assert_eq!(
+        sse::testing::try_send_status(&sender, notification()),
+        Err(axum::http::StatusCode::GONE),
+        "a dead session is gone, not full"
+    );
 }

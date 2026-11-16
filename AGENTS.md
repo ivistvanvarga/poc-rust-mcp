@@ -250,14 +250,19 @@ event, `POST /message?sessionId=…`, `Sse`/`KeepAlive`, a `Sink`/`Stream` trans
 - **A non-loopback bind requires a token *and* an explicit `sse_allowed_hosts`.** `Settings::from_config`
   rejects it early and `serve` repeats the check against `listener.local_addr()`, which is
   authoritative: a caller cannot pair a non-loopback listener with loopback defaults. A loopback bind
-  defaults to `localhost`, `127.0.0.1`, `[::1]`, pinned to the port actually bound.
+  defaults to `localhost`, `127.0.0.1`, `[::1]`, pinned to the port actually bound. A request
+  authority without a port names the default HTTP port (80), so `Host: localhost` is accepted on a
+  loopback bind to :80 rather than refused.
 - **`Origin` is a restriction, not CORS.** No CORS headers and no preflight are emitted. With no
   `sse_allowed_origins`, an origin is accepted only when its host equals the validated `Host` (and its
   effective port matches when the authority carried one), so a TLS-terminating proxy that forwards the
   original `Host` keeps working. `Origin: null` is rejected.
 - **Sessions are bounded and cleaned up.** IDs are 32 CSPRNG bytes, hex-encoded; the registry is
   capped (`sse_max_sessions`, default 64, answering `503` + `Retry-After: 5` past it); each inbound
-  queue holds `SESSION_QUEUE` (32) messages; a body over `MESSAGE_BODY_LIMIT` (256 KiB) is `413`.
+  queue holds `SESSION_QUEUE` (32) messages; a body over `MESSAGE_BODY_LIMIT` (256 KiB) is `413`, a
+  non-JSON body is `415`, and a POST into a full queue is `429` + `Retry-After: 1` (a closed session
+  is `410`). The full-queue branch is not reachable over the wire — the rmcp service drains the queue
+  as fast as the handler fills it — so `tests/sse.rs` pins the mapping through `sse::testing`.
   The response stream and the transport each own a `SessionCleanup`, so a client disconnect removes
   the map entry and cancels that session's `Calculator` without waiting for the transport task to
   notice the drop, and a service that ends on its own does the same without waiting for the client.
@@ -503,6 +508,12 @@ the only network transport), **RUSTSEC-2026-0459** (the bundled SQLite CVE, fixe
 database + WAL), and
 **RUSTSEC-2024-0436** (`paste` is unmaintained, not vulnerable; a build-time macro via rmcp 0.1.5).
 Add an ignore only with a written reason, here and in the file.
+
+GitHub's Dependabot is scored against the GitHub Advisory Database, a superset of RustSec, so it can
+list advisories `cargo audit` never sees — the four `rmcp` GHSAs (Streamable HTTP server transport,
+OAuth metadata discovery, OAuth client, HTTP-client redirect header leak) are the current example.
+They are not RustSec ids, so they cannot go in `.cargo/audit.toml`; the rationale lives in
+`SECURITY.md` under "Accepted risks", and the only version-level fix is the rmcp 2.x migration.
 
 ## Toolchain / git
 

@@ -147,12 +147,6 @@ impl Settings {
         self
     }
 
-    /// The configured address, before the actual listener is known.
-    #[must_use]
-    pub const fn address(&self) -> SocketAddr {
-        self.configured_addr
-    }
-
     /// Whether every accepted request must carry a bearer token.
     #[must_use]
     pub const fn requires_token(&self) -> bool {
@@ -600,9 +594,14 @@ fn normalize_authority(authority: &Authority) -> Option<(String, Option<u16>)> {
 }
 
 /// An allowlisted entry without a port matches any port on that host; one with a port is pinned.
+///
+/// A request authority with no explicit port names the scheme's default. This transport is plain
+/// HTTP, so that is 80 — without this a loopback bind to :80 would refuse `Host: localhost`, which
+/// names exactly the port it is listening on.
 fn host_allowed(patterns: &[HostPattern], host: &str, port: Option<u16>) -> bool {
+    let effective_port = port.unwrap_or(80);
     patterns.iter().any(|pattern| {
-        pattern.host == host && pattern.port.is_none_or(|pinned| Some(pinned) == port)
+        pattern.host == host && pattern.port.is_none_or(|pinned| pinned == effective_port)
     })
 }
 
@@ -706,5 +705,15 @@ pub mod testing {
     /// See the private [`super::parse_origin`].
     pub fn parse_origin(value: &str) -> Option<(String, String, u16)> {
         super::parse_origin(value)
+    }
+
+    /// See the private [`super::host_allowed`]. Patterns are given as their textual form so a test
+    /// does not need `config::parse_host_pattern`.
+    pub fn host_allowed(values: &[String], host: &str, port: Option<u16>) -> bool {
+        let patterns: Vec<HostPattern> = values
+            .iter()
+            .filter_map(|value| parse_host_pattern(value))
+            .collect();
+        super::host_allowed(&patterns, host, port)
     }
 }

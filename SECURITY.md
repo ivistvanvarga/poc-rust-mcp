@@ -67,10 +67,15 @@ The SSE transport (`src/sse.rs`) replaces rmcp 0.1.5's own, which performs no va
 
 Each is a deliberate, documented trade-off rather than an oversight.
 
-- **rmcp 0.1.5 — [RUSTSEC-2026-0189][rsec-0189].** The vulnerable component is the Streamable HTTP
-  *server* transport, which this crate does not use; the replacement in `src/sse.rs` performs the
-  `Host`/`Origin`/token validation rmcp omits. Upgrading rmcp would rewrite the tool layer, which is
-  out of scope.
+- **rmcp 0.1.5 — four GitHub advisories plus [RUSTSEC-2026-0189][rsec-0189], none reachable.**
+  The four GitHub-only ones are [GHSA-9pj6-vhgr-3mwh][ghsa-9pj6] (Streamable HTTP *server* transport
+  session-table leak), [GHSA-33f5-2c5q-wgwj][ghsa-33f5] and [GHSA-c9xm-49cp-xcr9][ghsa-c9xm] (OAuth
+  protected-resource metadata discovery and the OAuth client), and [GHSA-9g45-5xwm-f3wc][ghsa-9g45]
+  (HTTP client leaking headers on a cross-origin redirect). Every one is fixed only in rmcp 2.x, and
+  every one lives in a feature this crate does not enable: `cargo tree -e features -i rmcp` shows only
+  `base64`, `macros`, `server`, `transport-async-rw` and `transport-io`, and `src/sse.rs` — which does
+  the `Host`/`Origin`/token validation rmcp omits — is the only network transport. Upgrading rmcp to
+  2.x would rewrite the tool and handler layer, which is out of scope.
 - **Bundled SQLite — [RUSTSEC-2026-0459][rsec-0459].** Requires a crafted database plus WAL file that
   the victim opens, and is local-only. The fix ships in `libsqlite3-sys 0.39.0`, but sqlx 0.9 requires
   `>= 0.30.1, < 0.38.0` (the lock resolves `0.37.0`), so no compatible fixed release exists. Operators
@@ -89,6 +94,16 @@ Each is a deliberate, documented trade-off rather than an oversight.
 each with a written rationale, and are limited to the accepted risks above. Adding an ignore requires
 a reason in that file and in `AGENTS.md` — an unreviewed silence is not an option.
 
+GitHub's Dependabot alerts are scored against the GitHub Advisory Database, a superset of RustSec, so
+they can list an advisory `cargo audit` never sees. The `rmcp` alerts are the four GHSA advisories in
+*Accepted risks*: they are not in RustSec, so they cannot be entries in `.cargo/audit.toml`, and the
+only version-level fix for them is the rmcp 2.x migration. The `libsqlite3-sys` alert is
+[RUSTSEC-2026-0459][rsec-0459], already an ignore.
+
 [rsec-0189]: https://rustsec.org/advisories/RUSTSEC-2026-0189.html
 [rsec-0459]: https://rustsec.org/advisories/RUSTSEC-2026-0459.html
 [rsec-0436]: https://rustsec.org/advisories/RUSTSEC-2024-0436.html
+[ghsa-9pj6]: https://github.com/advisories/GHSA-9pj6-vhgr-3mwh
+[ghsa-33f5]: https://github.com/advisories/GHSA-33f5-2c5q-wgwj
+[ghsa-c9xm]: https://github.com/advisories/GHSA-c9xm-49cp-xcr9
+[ghsa-9g45]: https://github.com/advisories/GHSA-9g45-5xwm-f3wc

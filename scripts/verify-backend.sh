@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-3-Clause
 # Manual verification helper: drive the real binary over stdio against a live database.
 #
 #   ./scripts/verify-backend.sh 'mysql://mcp:mcp@127.0.0.1:3306/mcp'

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! MCP calculator server with an optional database-backed calculation history.
 //!
 //! The binary (`main.rs`) is a thin transport wrapper around this library; the split exists so the
@@ -18,3 +19,4 @@ pub mod db;
 pub mod prompts;
 pub mod resources;
 pub mod server;
+pub mod sse;

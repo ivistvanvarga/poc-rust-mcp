@@ -1,0 +1,12 @@
+[advisories]
+ignore = [
+    # rmcp's Streamable HTTP server transport. This crate does not use it; src/sse.rs is the
+    # only network transport and performs Host/Origin/token validation itself.
+    "RUSTSEC-2026-0189",
+    # Bundled SQLite CVE-2026-119375. Fixed in libsqlite3-sys >=0.39.0; sqlx 0.9 requires
+    # >=0.30.1,<0.38.0 (lock resolves 0.37.0), so the fix is unreachable. Local attack: a crafted
+    # database plus WAL pair the victim opens.
+    "RUSTSEC-2026-0459",
+    # paste is unmaintained, not vulnerable. Build-time macro reachable only via rmcp 0.1.5.
+    "RUSTSEC-2024-0436",
+]

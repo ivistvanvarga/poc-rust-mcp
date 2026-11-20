@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! `db` internals that no public API can reach.
 //!
 //! Relocated here from `src/db.rs`. Everything here goes through `db::testing`, the
@@ -10,6 +11,10 @@
 
 use poc_rust_mcp::db::{Dialect, Limits, Store, testing};
 use std::time::Duration;
+
+/// Same budget as the other degraded-storage tests: long enough to connect nowhere, short enough
+/// to keep the suite fast.
+const FAST: Duration = Duration::from_millis(250);
 
 #[test]
 fn successful_call_resets_the_breaker() {
@@ -53,6 +58,46 @@ async fn clones_share_one_schema_cell() {
         testing::schema_initialised(&detached),
         "a clone taken before the first migration must see that migration"
     );
+}
+
+#[test]
+fn redacted_urls_keep_the_backend_but_never_the_credentials() {
+    let cases = [
+        (
+            "postgres://mcp:supersecret@example.com:5432/mcp?password=alsosecret",
+            "postgres://***@example.com:5432/mcp",
+        ),
+        (
+            "mysql://user@[::1]:3306/db?ssl-mode=REQUIRED",
+            "mysql://***@[::1]:3306/db",
+        ),
+        ("postgres://example.com/mcp", "postgres://example.com/mcp"),
+        ("not-a-url", "<redacted>"),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(testing::redact_url(input), expected, "{input}");
+    }
+}
+
+#[tokio::test]
+async fn saturated_write_slots_drop_records_instead_of_blocking_the_caller() {
+    let store = Store::connect_with_timeout("postgres://mcp:mcp@127.0.0.1:1/mcp", FAST);
+    let held = testing::take_write_permits(&store);
+    assert_eq!(held.len(), poc_rust_mcp::db::MAX_PENDING_WRITES);
+    let started = std::time::Instant::now();
+    store.record_success("add", serde_json::json!({ "a": 1, "b": 1 }), "2");
+    assert_eq!(testing::dropped_writes(&store), 1);
+    assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    drop(held);
+}
+
+#[test]
+fn prune_sql_uses_the_dialect_placeholder_and_mysql_derived_table() {
+    assert!(testing::prune_sql(Dialect::Postgres).contains("$1"));
+    assert!(testing::prune_sql(Dialect::Sqlite).contains('?'));
+    let mysql = testing::prune_sql(Dialect::MySql);
+    assert!(mysql.contains("DELETE h FROM"), "{mysql}");
+    assert!(mysql.contains("LEFT JOIN"), "{mysql}");
 }
 
 #[test]

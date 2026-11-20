@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! The resource surface: calculation history, exposed as readable MCP resources.
 //!
 //! A resource is a read-only document a client can pull in wholesale, complementing the tools: a

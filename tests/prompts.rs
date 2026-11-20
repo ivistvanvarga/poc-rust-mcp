@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! The prompt catalogue, tested directly against its public functions.
 //!
 //! Relocated here from `src/prompts.rs`: the catalogue is a pure function of its inputs, so the only

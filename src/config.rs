@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! Layered configuration for the MCP server.
 //!
 //! Four layers, each overriding the previous one:
@@ -28,8 +29,13 @@ use std::{
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
+use http::uri::{Authority, Uri};
+
 /// Default bind address for `--sse`.
 pub const DEFAULT_SSE_ADDRESS: &str = "127.0.0.1:8000";
+
+/// Default cap on simultaneous SSE sessions.
+pub const DEFAULT_SSE_MAX_SESSIONS: usize = 64;
 
 /// Default `tracing` filter when `RUST_LOG` is unset.
 pub const DEFAULT_LOG_FILTER: &str = "info";
@@ -57,6 +63,14 @@ pub mod env_keys {
     pub const STORAGE_BREAKER_COOLDOWN_MS: &str = "MCP_STORAGE_BREAKER_COOLDOWN_MS";
     /// Upper bound on rows returned by `calc_history`.
     pub const STORAGE_MAX_HISTORY_ROWS: &str = "MCP_STORAGE_MAX_HISTORY_ROWS";
+    /// Comma-separated `Host` authorities the SSE transport accepts.
+    pub const SSE_ALLOWED_HOSTS: &str = "MCP_SSE_ALLOWED_HOSTS";
+    /// Comma-separated browser origins the SSE transport accepts.
+    pub const SSE_ALLOWED_ORIGINS: &str = "MCP_SSE_ALLOWED_ORIGINS";
+    /// Bearer token required on every SSE request.
+    pub const SSE_TOKEN: &str = "MCP_SSE_TOKEN";
+    /// Maximum simultaneous SSE sessions.
+    pub const SSE_MAX_SESSIONS: &str = "MCP_SSE_MAX_SESSIONS";
 }
 
 /// Everything the server needs, after all four layers have been merged.
@@ -79,6 +93,139 @@ pub struct ServerConfig {
     /// or to a test, which sets it low to walk a cursor. It exists because pagination that cannot
     /// be exercised is pagination that rots.
     pub list_page_size: usize,
+    /// Host authorities accepted by the SSE transport, from configuration.
+    ///
+    /// Entries are `host` or `host:port`; an entry without a port matches any port on that host.
+    /// Empty means "loopback defaults" when the listener is on a loopback address, and is a
+    /// startup error otherwise (see [`crate::sse::Settings`]).
+    pub sse_allowed_hosts: Vec<String>,
+    /// Browser `Origin` values accepted by the SSE transport.
+    ///
+    /// This is a *restriction* list, not a CORS configuration: matching requests are allowed, but
+    /// no `Access-Control-Allow-*` headers are ever emitted, and preflights are not answered.
+    pub sse_allowed_origins: Vec<String>,
+    /// Bearer token required by the SSE transport. `None` means no token, which is only allowed on
+    /// a loopback listener.
+    pub sse_token: Option<Secret>,
+    /// Maximum number of simultaneous SSE sessions.
+    pub sse_max_sessions: usize,
+}
+
+/// A string that must not be printed.
+///
+/// `ServerConfig` derives `Debug`, and every layer of configuration is routinely logged at debug
+/// level. A token in that log line would be the whole secret, so the only formatting this type
+/// allows is the redacted one.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// The secret itself. Call this only where the value is actually used.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secret(***)")
+    }
+}
+
+/// One entry in `sse_allowed_hosts`: a host, optionally pinned to a port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostPattern {
+    pub(crate) host: String,
+    pub(crate) port: Option<u16>,
+}
+
+/// One entry in `sse_allowed_origins`: scheme, host, and optional pinned port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OriginPattern {
+    pub(crate) scheme: String,
+    pub(crate) host: String,
+    pub(crate) port: Option<u16>,
+}
+
+/// Lowercase a host for comparison, rejecting values that could never be a host.
+///
+/// Brackets around an IPv6 literal are stripped, as is one trailing root dot; both are spelling
+/// differences for the same host, and a comparison that missed them would be a security bug in
+/// whichever direction it failed.
+pub(crate) fn normalize_host(host: &str) -> Option<String> {
+    let host = host.trim();
+    if host.is_empty() || host.contains('%') || host.contains('*') {
+        return None;
+    }
+    if host.chars().any(char::is_control) {
+        return None;
+    }
+    let host = host.strip_prefix('[').unwrap_or(host);
+    let host = host.strip_suffix(']').unwrap_or(host);
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+/// Parse one `host` or `host:port` allowlist entry.
+///
+/// Anything with a path, scheme, userinfo, wildcard or port 0 is rejected: this is an allowlist, and
+/// an entry that could match more than the operator intended has no place in one.
+pub(crate) fn parse_host_pattern(value: &str) -> Option<HostPattern> {
+    let value = value.trim();
+    if value.is_empty() || value.contains('@') {
+        return None;
+    }
+    let authority: Authority = value.parse().ok()?;
+    if authority.port_u16() == Some(0) {
+        return None;
+    }
+    Some(HostPattern {
+        host: normalize_host(authority.host())?,
+        port: authority.port_u16(),
+    })
+}
+
+/// Parse one browser-origin allowlist entry.
+///
+/// Only an origin (`scheme://host[:port]`) is accepted: a path or query would suggest that the
+/// allowlist is a URL filter, and a wildcard would defeat its purpose.
+pub(crate) fn parse_origin_pattern(value: &str) -> Option<OriginPattern> {
+    let value = value.trim();
+    if value.is_empty() || value.contains('*') || value.contains('@') {
+        return None;
+    }
+    let uri: Uri = value.parse().ok()?;
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let authority = uri.authority()?;
+    if authority.port_u16() == Some(0) {
+        return None;
+    }
+    if let Some(path_and_query) = uri.path_and_query() {
+        let path = path_and_query.path();
+        if !path.is_empty() && path != "/" {
+            return None;
+        }
+        if path_and_query.query().is_some() {
+            return None;
+        }
+    }
+    Some(OriginPattern {
+        scheme,
+        host: normalize_host(authority.host())?,
+        port: authority.port_u16(),
+    })
 }
 
 /// Calculation-history settings. `url: None` means storage is disabled.
@@ -117,6 +264,10 @@ impl Default for ServerConfig {
                 .expect("the built-in default SSE address is a valid socket address"),
             log_filter: DEFAULT_LOG_FILTER.to_owned(),
             list_page_size: crate::server::DEFAULT_LIST_PAGE_SIZE,
+            sse_allowed_hosts: Vec::new(),
+            sse_allowed_origins: Vec::new(),
+            sse_token: None,
+            sse_max_sessions: DEFAULT_SSE_MAX_SESSIONS,
         }
     }
 }
@@ -293,6 +444,23 @@ MCP features:
   completion  argument values for prompts and resource templates
   All */list methods are paginated (server.list_page_size).
 
+SSE security:
+  A loopback listener (the 127.0.0.1 default) trusts local processes. Anything else —
+  --sse 0.0.0.0:9000 included — requires MCP_SSE_TOKEN *and* MCP_SSE_ALLOWED_HOSTS, and
+  the server refuses to start without them.
+    MCP_SSE_TOKEN          Bearer token; send it as `Authorization: Bearer <token>`.
+                           There is deliberately no --sse-token flag: a command line is
+                           world-readable through ps and the shell history.
+    MCP_SSE_ALLOWED_HOSTS  Comma-separated Host values, host or host:port. A Host without
+                           a port matches any port on that host. Non-loopback needs this.
+    MCP_SSE_ALLOWED_ORIGINS
+                           Comma-separated browser origins (https://ui.example). This is a
+                           restriction list, not CORS: no CORS headers are sent and
+                           preflights are not answered.
+    MCP_SSE_MAX_SESSIONS   Maximum simultaneous sessions (default 64).
+  Every request's Host and Origin are checked before its token. Behind a reverse proxy,
+  forward the original Host header; X-Forwarded-Host is not trusted.
+
 Environment:
   DATABASE_URL   database URL for calculation history, e.g.
                  postgres://mcp:mcp@127.0.0.1:5432/mcp
@@ -300,6 +468,10 @@ Environment:
   RUST_LOG       Log filter, e.g. RUST_LOG=debug (logs go to stderr)
   MCP_LIST_PAGE_SIZE
                  Rows per page for the MCP */list methods (default 20)
+  MCP_SSE_ADDRESS, MCP_SSE_TOKEN, MCP_SSE_ALLOWED_HOSTS, MCP_SSE_ALLOWED_ORIGINS,
+  MCP_SSE_MAX_SESSIONS
+                 See the SSE security section above.
+  MCP_STORAGE_*  See config.example.toml for the storage tuning knobs.
 
 See config.example.toml for every file setting.
 "
@@ -390,6 +562,18 @@ impl Config {
             config.storage.max_history_rows =
                 parse_number(env_keys::STORAGE_MAX_HISTORY_ROWS, &value)?;
         }
+        if let Some(value) = non_blank(env.get(env_keys::SSE_ALLOWED_HOSTS)) {
+            config.server.sse_allowed_hosts = parse_list(&value);
+        }
+        if let Some(value) = non_blank(env.get(env_keys::SSE_ALLOWED_ORIGINS)) {
+            config.server.sse_allowed_origins = parse_list(&value);
+        }
+        if let Some(value) = non_blank(env.get(env_keys::SSE_TOKEN)) {
+            config.server.sse_token = Some(Secret::new(value));
+        }
+        if let Some(value) = non_blank(env.get(env_keys::SSE_MAX_SESSIONS)) {
+            config.server.sse_max_sessions = parse_number(env_keys::SSE_MAX_SESSIONS, &value)?;
+        }
 
         // Layer 4: flags.
         if let Some(url) = &cli.database_url {
@@ -421,6 +605,18 @@ impl Config {
         }
         if let Some(value) = file.server.list_page_size {
             self.server.list_page_size = value;
+        }
+        if let Some(hosts) = file.server.sse_allowed_hosts {
+            self.server.sse_allowed_hosts = hosts;
+        }
+        if let Some(origins) = file.server.sse_allowed_origins {
+            self.server.sse_allowed_origins = origins;
+        }
+        if let Some(token) = file.server.sse_token {
+            self.server.sse_token = Some(Secret::new(token));
+        }
+        if let Some(value) = file.server.sse_max_sessions {
+            self.server.sse_max_sessions = value;
         }
 
         if let Some(url) = file.storage.url {
@@ -491,6 +687,41 @@ impl Config {
                     .to_owned(),
             });
         }
+        if self.server.sse_max_sessions == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "server.sse_max_sessions".to_owned(),
+                value: "0".to_owned(),
+                reason: "must be at least 1; 0 would refuse every SSE session".to_owned(),
+            });
+        }
+        if let Some(token) = &self.server.sse_token
+            && token.expose().trim().is_empty()
+        {
+            return Err(ConfigError::InvalidValue {
+                key: "server.sse_token".to_owned(),
+                value: String::new(),
+                reason: "must not be blank".to_owned(),
+            });
+        }
+        for host in &self.server.sse_allowed_hosts {
+            if parse_host_pattern(host).is_none() {
+                return Err(ConfigError::InvalidValue {
+                    key: "server.sse_allowed_hosts".to_owned(),
+                    value: host.clone(),
+                    reason: "expected host or host:port, without scheme, path, userinfo or port 0"
+                        .to_owned(),
+                });
+            }
+        }
+        for origin in &self.server.sse_allowed_origins {
+            if parse_origin_pattern(origin).is_none() {
+                return Err(ConfigError::InvalidValue {
+                    key: "server.sse_allowed_origins".to_owned(),
+                    value: origin.clone(),
+                    reason: "expected scheme://host[:port] with no path or query".to_owned(),
+                });
+            }
+        }
         // Surface a bad filter now instead of letting `tracing_subscriber` quietly fall back.
         EnvFilter::try_new(&self.server.log_filter).map_err(|error| ConfigError::InvalidValue {
             key: "server.log_filter".to_owned(),
@@ -520,6 +751,14 @@ where
     })
 }
 
+/// Split a comma-separated env value, keeping empty entries so validation can reject them.
+fn parse_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|entry| entry.trim().to_owned())
+        .collect()
+}
+
 /// Sparse mirror of [`Config`]: every field optional, so only what the file actually sets wins.
 ///
 /// `deny_unknown_fields` turns a misspelled key into a startup error rather than a setting that
@@ -539,6 +778,10 @@ struct FileServer {
     sse_address: Option<String>,
     log_filter: Option<String>,
     list_page_size: Option<usize>,
+    sse_allowed_hosts: Option<Vec<String>>,
+    sse_allowed_origins: Option<Vec<String>>,
+    sse_token: Option<String>,
+    sse_max_sessions: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]

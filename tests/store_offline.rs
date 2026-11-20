@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! Storage behaviour that must hold **without a live database**.
 //!
 //! `Store` is designed so that a missing or unreachable database degrades instead of breaking the
@@ -150,6 +151,20 @@ fn history_limit_is_clamped_to_the_configured_maximum() {
     // A nonsensical cap must not panic or produce an inverted range.
     assert_eq!(clamp_history_limit(50, 0), 1);
     assert_eq!(clamp_history_limit(50, -5), 1);
+}
+
+#[tokio::test]
+async fn client_facing_errors_never_echo_the_url_or_driver_text() {
+    let store = Store::connect_with_timeout("postgres://mcp:supersecret@127.0.0.1:1/mcp", FAST);
+    let error = store.status().await.expect_err("the database is down");
+    assert!(!error.contains("supersecret"), "{error}");
+    assert!(!error.contains("127.0.0.1"), "{error}");
+    assert!(!error.contains("connection refused"), "{error}");
+    assert!(!error.contains("sqlx"), "{error}");
+    assert!(
+        error.contains("database unreachable") || error.contains("migration failed"),
+        "{error}"
+    );
 }
 
 #[tokio::test]

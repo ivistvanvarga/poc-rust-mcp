@@ -4,16 +4,17 @@
 
 Crate `poc-rust-mcp` (edition 2024) with **both** a lib and a bin target:
 
-- `src/lib.rs` — exposes `pub mod config`, `db`, `prompts`, `resources` and `server`, so every test in
-  `tests/` can drive the server's public surface directly.
+- `src/lib.rs` — exposes `pub mod config`, `db`, `prompts`, `resources`, `server` and `sse`, so every
+  test in `tests/` can drive the server's public surface directly.
 - `src/main.rs` — thin transport wiring (tracing, stdio/SSE), imports the lib rather than declaring
   `mod` items itself; all argument parsing lives in `config`. `main.rs::calculator` is the only place
   a `Calculator` is built, so a new server setting must be threaded through there for both transports.
 - `src/config.rs` — layered configuration, `src/server.rs` — the `Calculator`: tools, `ServerHandler`,
   peer/subscriptions/log level/page size. `src/prompts.rs` — the prompt catalogue.
   `src/resources.rs` — resource catalogue, URI routing, reads from the store.
-  `src/db.rs` — all database access, `migrations/{postgres,mysql,sqlite}/` — per-dialect sqlx
-  migrations, `config.example.toml` — the documented example (copy to the git-ignored `config.toml`).
+  `src/db.rs` — all database access, `src/sse.rs` — the validating SSE transport (rmcp's own is
+  dropped), `migrations/{postgres,mysql,sqlite}/` — per-dialect sqlx migrations,
+  `config.example.toml` — the documented example (copy to the git-ignored `config.toml`).
 
 ## The `ServerHandler` impl block is NOT annotated `#[tool(tool_box)]`
 
@@ -232,6 +233,41 @@ Everything else (help text, diagnostics) must stay off stdout in stdio mode. The
 the *client* side of a hand-rolled smoke test: one stray non-JSON line on the server's stdin
 desynchronises the stream and silently drops responses.
 
+## The SSE transport (`src/sse.rs`) replaces rmcp's
+
+rmcp 0.1.5's `transport-sse-server` (RUSTSEC-2026-0189) accepts every request — no token, no
+`Host`/`Origin` check, an unbounded session map — so the crate drops it (`rmcp` keeps `server` and
+`transport-io` only) and ships its own in `src/sse.rs`. The MCP framing is unchanged: the endpoint
+event, `POST /message?sessionId=…`, `Sse`/`KeepAlive`, a `Sink`/`Stream` transport. Invariants:
+
+- **Validation order is authority → `Host` allowlist → `Origin` → token.** A browser under DNS
+  rebinding sends a foreign `Host`, so the host check is the first thing that can reject it; the
+  token comparison is spent only once the request is plausibly for this server. A bad host or origin
+  is `403`; a missing or wrong token is `401` with `WWW-Authenticate: Bearer`.
+- **The token is header-only** (`Authorization: Bearer …`), never a query string, and compared in
+  constant time with the length folded in. There is deliberately **no CLI flag** — a command line is
+  visible in `ps`; `--help` and `config.example.toml` document `MCP_SSE_TOKEN` instead.
+- **A non-loopback bind requires a token *and* an explicit `sse_allowed_hosts`.** `Settings::from_config`
+  rejects it early and `serve` repeats the check against `listener.local_addr()`, which is
+  authoritative: a caller cannot pair a non-loopback listener with loopback defaults. A loopback bind
+  defaults to `localhost`, `127.0.0.1`, `[::1]`, pinned to the port actually bound. A request
+  authority without a port names the default HTTP port (80), so `Host: localhost` is accepted on a
+  loopback bind to :80 rather than refused.
+- **`Origin` is a restriction, not CORS.** No CORS headers and no preflight are emitted. With no
+  `sse_allowed_origins`, an origin is accepted only when its host equals the validated `Host` (and its
+  effective port matches when the authority carried one), so a TLS-terminating proxy that forwards the
+  original `Host` keeps working. `Origin: null` is rejected.
+- **Sessions are bounded and cleaned up.** IDs are 32 CSPRNG bytes, hex-encoded; the registry is
+  capped (`sse_max_sessions`, default 64, answering `503` + `Retry-After: 5` past it); each inbound
+  queue holds `SESSION_QUEUE` (32) messages; a body over `MESSAGE_BODY_LIMIT` (256 KiB) is `413`, a
+  non-JSON body is `415`, and a POST into a full queue is `429` + `Retry-After: 1` (a closed session
+  is `410`). The full-queue branch is not reachable over the wire — the rmcp service drains the queue
+  as fast as the handler fills it — so `tests/sse.rs` pins the mapping through `sse::testing`.
+  The response stream and the transport each own a `SessionCleanup`, so a client disconnect removes
+  the map entry and cancels that session's `Calculator` without waiting for the transport task to
+  notice the drop, and a service that ends on its own does the same without waiting for the client.
+  Removal is idempotent — keep the two guards independent.
+
 ## Run modes
 
 ```bash
@@ -309,6 +345,13 @@ they come from `config::StorageConfig` via `db::Limits`.
 - **History writes are fire-and-forget** (`tokio::spawn` in `record_success`/`record_failure`) so
   arithmetic tools never block on the database. Consequence: a row can be lost if the process exits
   immediately after the tool returns. Do not "fix" this by awaiting the insert.
+- **Retention and bounds.** `max_history_rows` caps *stored* rows, not just reads: after a successful
+  insert the same detached task prunes the table to the newest N (`Dialect::prune_sql`; MySQL uses a
+  derived-table `DELETE`, because it cannot reference the target table in a subquery), and
+  `Store::list` clamps its argument to `1..=max_history_rows`. Pending history writes are capped at
+  `MAX_PENDING_WRITES` (64) through a `Semaphore`; when it is full the record is dropped with a
+  `debug!` rather than blocking the tool. Subscriptions are capped at `MAX_SUBSCRIPTIONS` (256) per
+  client, with `Calculator::with_subscription_limit` for tests.
 - **Circuit breaker** (`Store::breaker`): after 2 *connectivity* failures storage is skipped for
   30s, and each attempt is bounded by a 3s acquire timeout. These are `Limits` fields sourced from
   configuration, not constants. Only connectivity errors may trip it — `is_connectivity_error`
@@ -317,12 +360,15 @@ they come from `config::StorageConfig` via `db::Limits`.
   migration `OnceCell` so callers already queued behind it fail fast instead of each retrying.
 - `clear_calc_history` uses `DELETE`, **not** `TRUNCATE`: `TRUNCATE` reports no row count on
   PostgreSQL or MySQL, so `rows_affected` would always be 0 and the tool would report a lie.
-- sqlx runs with `default-features = false` and **no compile-time checked queries** — `query_as` plus
-  `#[derive(FromRow)]`. That is intentional: `query!` would require `DATABASE_URL` or a committed
-  `.sqlx` offline cache at build time. Adding a new sqlx capability may mean enabling another
-  feature (`json` is required for `serde_json::Value` columns — including on SQLite, where JSON is
-  just TEXT; `chrono` for `DateTime<Utc>`; `sqlite` is **bundled**, so it builds SQLite from C source
-  and needs a C compiler).
+- sqlx **0.9** runs with `default-features = false` and **no compile-time checked queries** —
+  `query_as` plus `#[derive(FromRow)]`. That is intentional: `query!` would require `DATABASE_URL` or
+  a committed `.sqlx` offline cache at build time. In 0.9 `query`/`query_as` take `impl SqlSafeStr`,
+  implemented natively only for `&'static str`, so every SQL string built by `Dialect::*_sql()` is
+  wrapped in `sqlx::AssertSqlSafe(...)` at its call site — the text is static fragments plus bind
+  placeholders, never user input. Adding a new sqlx capability may mean enabling another feature
+  (`json` is required for `serde_json::Value` columns — including on SQLite, where JSON is just TEXT;
+  `chrono` for `DateTime<Utc>`; `sqlite-bundled`, **not** `sqlite`, builds only the C library and not
+  deserialize/load-extension/unlock-notify, so it needs a C compiler).
 
 ## Devcontainer (podman-compose)
 
@@ -368,6 +414,12 @@ The protocol-level files spawn the compiled binary, so `cargo test` builds the b
   mechanics: capabilities (and the ones deliberately *not* advertised), `ping`, `tools/list`, argument
   validation, tool errors vs JSON-RPC errors, stdout purity, and that progress/cancellation
   notifications leave the server working.
+- `tests/sse.rs` drives the in-process transport on `127.0.0.1:0` with a hand-rolled **HTTP/1.0**
+  client over `tokio::net::TcpStream` — HTTP/1.0 closes the body at EOF, so no chunked parser (and no
+  HTTP-client dev-dependency) is needed. It covers a foreign `Host`/`Origin` (`403`), the bearer token
+  on both routes (`401`), the proxy-style `Origin` that must be accepted, a full `initialize` →
+  `notifications/initialized` → `tools/call add` handshake over the event stream, the session cap
+  (`503`), and session release after a stream drop (poll the POST until `404`).
 - `tests/mcp_features.rs` covers every feature *beyond* tools through the same transport: the prompt
   catalogue and its validation, resource routing and degradation, subscription announcements, the
   logging level filter, completion, and a cursor walk over all four paginated methods. A handler can be
@@ -379,17 +431,20 @@ The protocol-level files spawn the compiled binary, so `cargo test` builds the b
   argument validation, URI routing, and reads against an in-memory SQLite store.
 - `tests/store_offline.rs` exercises the public `Store`/`HistoryEntry` surface **without** a live
   database: scheme→backend selection, disabled storage, unparsable and unsupported URLs, bounded
-  failure, breaker tripping, fire-and-forget writes. Runs against a dead PostgreSQL *and* a dead
-  MySQL URL, so the degradation guarantees are not proved for one driver only.
+  failure, breaker tripping, fire-and-forget writes, and that a client-facing error never echoes the
+  URL, host, port, password or driver text. Runs against a dead PostgreSQL *and* a dead MySQL URL, so
+  the degradation guarantees are not proved for one driver only.
 - `tests/sqlite_backend.rs` is the only layer that needs a **real, working** database, and SQLite is
   the only one that can be: embedded, in-process, nothing to install. It covers migrations, a JSON
-  and a timestamp column surviving a round trip, newest-first ordering, `DELETE` row counts, and a
-  file-backed database persisting across two stores.
+  and a timestamp column surviving a round trip, newest-first ordering, `DELETE` row counts, retention
+  to `max_history_rows`, the read clamp, a new file created `0600` on Unix (and an existing one left
+  alone), and a file-backed database persisting across two stores.
 - `tests/config.rs` pins the layering: precedence, defaults with no file at all, blank-value handling,
   rejected unknown keys and out-of-range values, CLI parsing, and that resolved settings and the
   resolved URL's backend reach the `Store`.
 - `tests/db.rs` holds the few behaviours no public API can reach — the circuit breaker's bookkeeping,
-  the shared schema cell, the per-dialect SQL and migration sets, SQLite URL parsing.
+  the shared schema cell, the per-dialect SQL and migration sets (including `prune_sql`), `redact_url`,
+  the pending-write semaphore, and SQLite URL parsing.
 
 ### `db::testing` and `server::testing` exist for `tests/`
 
@@ -441,21 +496,42 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build
+cargo audit
 ```
 
 No CI, no `[lints]` table — clippy defaults only, so `-D warnings` must pass cleanly.
+
+`cargo audit` must also exit 0. `.cargo/audit.toml` records three reviewed ignores, each with its
+rationale: **RUSTSEC-2026-0189** (rmcp's Streamable HTTP server transport — unused; `src/sse.rs` is
+the only network transport), **RUSTSEC-2026-0459** (the bundled SQLite CVE, fixed only in
+`libsqlite3-sys >= 0.39`, outside sqlx 0.9's `>= 0.30.1, < 0.38.0` range; local, needs a crafted
+database + WAL), and
+**RUSTSEC-2024-0436** (`paste` is unmaintained, not vulnerable; a build-time macro via rmcp 0.1.5).
+Add an ignore only with a written reason, here and in the file.
+
+GitHub's Dependabot is scored against the GitHub Advisory Database, a superset of RustSec, so it can
+list advisories `cargo audit` never sees — the four `rmcp` GHSAs (Streamable HTTP server transport,
+OAuth metadata discovery, OAuth client, HTTP-client redirect header leak) are the current example.
+They are not RustSec ids, so they cannot go in `.cargo/audit.toml`; the rationale lives in
+`SECURITY.md` under "Accepted risks", and the only version-level fix is the rmcp 2.x migration.
 
 ## Toolchain / git
 
 - `rust-toolchain.toml` pins `stable` + `clippy`/`rustfmt`. Edition 2024 needs Rust >= 1.85.
 - `tracing-subscriber` needs `features = ["env-filter"]` for `RUST_LOG` support; it is not a default.
   `config.rs` also uses `EnvFilter::try_new` to reject a bad filter at startup.
-- `Cargo.lock` is **committed**. `.gitignore` contains only `/target` and `/config.toml`; commit the
-  lockfile whenever deps change.
-- **Licensing: BSD 2-Clause, and `LICENSE` is the authoritative copy.** There are no per-file
-  headers, which is the usual Rust convention — do not add one without being asked. Three places
-  mention the licence and must agree: the SPDX identifier `license = "BSD-2-Clause"` in
-  `Cargo.toml`, the header in `LICENSE`, and the `## License` section in `README.md`. The `LICENSE`
-  text is the SPDX `BSD-2-Clause` template verbatim with only the year and copyright holder
-  substituted, so do not reflow it; if the variant ever changes to 3-Clause (which adds a
-  non-endorsement clause), change all three and replace the file with the SPDX `BSD-3-Clause` text.
+- `Cargo.lock` is **committed**. `.gitignore` contains only `/target`, `/config.toml` and `*.db`;
+  commit the lockfile whenever deps change.
+- **Licensing: BSD 3-Clause, and `LICENSE` is the authoritative copy.** Every Rust file and the
+  verification script carries an `SPDX-License-Identifier: BSD-3-Clause` header on its first line (after
+  the shebang, in the script). Keep it there when adding files. Three more places mention the licence
+  and must agree: the SPDX identifier `license = "BSD-3-Clause"` in `Cargo.toml`, the header in
+  `LICENSE`, and the `## License` section in `README.md`. The `LICENSE` text is the SPDX
+  `BSD-3-Clause` template verbatim with only the year and copyright holder substituted, so do not
+  reflow it. Clause 3 is the non-endorsement clause; dropping it would make this the *2*-Clause
+  variant, so the two cannot be changed independently.
+- **Never add a header to `migrations/*.sql`, not even a comment.** sqlx stores each migration's
+  SHA-384 as its checksum, so a single added byte makes every existing PostgreSQL deployment fail the
+  next storage call with `VersionMismatch`. `tests/db.rs` pins the shipped file against the migrator's
+  embedded copy for exactly this reason. A licence header in a migration would cost more than it is
+  worth; the repository's `LICENSE` covers those files anyway.

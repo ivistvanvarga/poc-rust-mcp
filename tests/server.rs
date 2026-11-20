@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! The `Calculator`: its tools, its `ServerHandler` hooks, and its page size.
 //!
 //! Relocated here from `src/server.rs`, with one deliberate rewrite: the tool functions are
@@ -313,6 +314,42 @@ async fn subscribing_is_refused_for_a_resource_this_server_does_not_serve() {
         .await
         .expect_err("must be refused");
     assert!(error.message.contains("file:///etc/passwd"), "{error}");
+}
+
+#[tokio::test]
+async fn subscriptions_are_capped_per_client() {
+    let calculator = Calculator::new(Store::disabled()).with_subscription_limit(2);
+    for uri in [resources::HISTORY_URI, "calc://history/1"] {
+        calculator
+            .subscribe(
+                SubscribeRequestParam {
+                    uri: uri.to_owned(),
+                },
+                request_context(),
+            )
+            .await
+            .expect("within the cap");
+    }
+    // Re-subscribing to the same URI is free.
+    calculator
+        .subscribe(
+            SubscribeRequestParam {
+                uri: resources::HISTORY_URI.to_owned(),
+            },
+            request_context(),
+        )
+        .await
+        .expect("duplicate subscription");
+    let error = calculator
+        .subscribe(
+            SubscribeRequestParam {
+                uri: "calc://history/2".to_owned(),
+            },
+            request_context(),
+        )
+        .await
+        .expect_err("cap exceeded");
+    assert!(error.message.contains("too many"), "{error}");
 }
 
 #[tokio::test]

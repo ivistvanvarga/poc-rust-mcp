@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! The resource catalogue, tested directly against its public functions.
 //!
 //! Relocated here from `src/resources.rs`. These use SQLite in memory where a real database is

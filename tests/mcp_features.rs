@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 //! The MCP features beyond tools, driven through the real stdio transport.
 //!
 //! `tests/stdio_protocol.rs` covers protocol mechanics; this file proves each server-side feature

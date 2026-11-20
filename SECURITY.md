@@ -35,9 +35,9 @@ public issue for anything that could be exploited before a fix ships.
 
 ## What is enforced
 
-The SSE transport (`src/sse.rs`) replaces rmcp 0.1.5's own, which performs no validation at all
-(see [RUSTSEC-2026-0189][rsec-0189] below). Every request on both routes — `GET /sse` and
-`POST /message` — passes the same chain before a handler runs:
+The SSE transport (`src/sse.rs`) replaces rmcp's own transports, which perform no
+`Host`/`Origin`/token validation. Every request on both routes — `GET /sse` and `POST /message` —
+passes the same chain before a handler runs:
 
 - **`Host` allowlist.** The request authority is taken from the `Host` header, or from the URI
   authority (HTTP/2 `:authority`) when the header is absent. Hosts are compared after lowercasing and
@@ -63,25 +63,31 @@ The SSE transport (`src/sse.rs`) replaces rmcp 0.1.5's own, which performs no va
 - **Coarse, non-leaking errors.** Client-facing storage errors never echo the URL, credentials, host,
   or driver text; the full error stays in the server log. Database URLs are redacted before logging.
 
+## Resolved by the rmcp 3.10 upgrade
+
+The crate used to pin rmcp 0.1.5, whose affected features this crate never enabled. The upgrade to
+3.10 removes the affected code entirely, so these advisories are no longer accepted risks and no
+longer appear in `.cargo/audit.toml`:
+
+- [RUSTSEC-2026-0189][rsec-0189] / [GHSA-9pj6-vhgr-3mwh][ghsa-9pj6] — Streamable HTTP *server*
+  transport session-table leak.
+- [GHSA-33f5-2c5q-wgwj][ghsa-33f5] and [GHSA-c9xm-49cp-xcr9][ghsa-c9xm] — OAuth protected-resource
+  metadata discovery and the OAuth client.
+- [GHSA-9g45-5xwm-f3wc][ghsa-9g45] — HTTP client leaking headers on a cross-origin redirect.
+- [RUSTSEC-2024-0436][rsec-0436] — `paste`, an unmaintained build-time macro dependency of rmcp 0.1.5
+  (replaced by `pastey` in 3.x).
+
+The custom SSE transport stays for defence in depth: it validates `Host`, `Origin` and bearer tokens
+that rmcp's transports do not, not because an advisory is outstanding.
+
 ## Accepted risks
 
 Each is a deliberate, documented trade-off rather than an oversight.
 
-- **rmcp 0.1.5 — four GitHub advisories plus [RUSTSEC-2026-0189][rsec-0189], none reachable.**
-  The four GitHub-only ones are [GHSA-9pj6-vhgr-3mwh][ghsa-9pj6] (Streamable HTTP *server* transport
-  session-table leak), [GHSA-33f5-2c5q-wgwj][ghsa-33f5] and [GHSA-c9xm-49cp-xcr9][ghsa-c9xm] (OAuth
-  protected-resource metadata discovery and the OAuth client), and [GHSA-9g45-5xwm-f3wc][ghsa-9g45]
-  (HTTP client leaking headers on a cross-origin redirect). Every one is fixed only in rmcp 2.x, and
-  every one lives in a feature this crate does not enable: `cargo tree -e features -i rmcp` shows only
-  `base64`, `macros`, `server`, `transport-async-rw` and `transport-io`, and `src/sse.rs` — which does
-  the `Host`/`Origin`/token validation rmcp omits — is the only network transport. Upgrading rmcp to
-  2.x would rewrite the tool and handler layer, which is out of scope.
 - **Bundled SQLite — [RUSTSEC-2026-0459][rsec-0459].** Requires a crafted database plus WAL file that
   the victim opens, and is local-only. The fix ships in `libsqlite3-sys 0.39.0`, but sqlx 0.9 requires
   `>= 0.30.1, < 0.38.0` (the lock resolves `0.37.0`), so no compatible fixed release exists. Operators
   who need the fix sooner can build against a patched system SQLite with `sqlite-unbundled`.
-- **`paste` — [RUSTSEC-2024-0436][rsec-0436].** Unmaintained, not vulnerable: a build-time macro
-  dependency of rmcp 0.1.5, with no runtime component.
 - **Loopback SSE without a token.** Any local process can call the tools. Intended for local
   development; the remote-web-page threat is what the `Host`/`Origin` checks and the optional token
   address.
@@ -90,15 +96,15 @@ Each is a deliberate, documented trade-off rather than an oversight.
 
 ## Dependency audit
 
-`cargo audit` must exit 0. Reviewed advisory ignores live in [`.cargo/audit.toml`](.cargo/audit.toml),
-each with a written rationale, and are limited to the accepted risks above. Adding an ignore requires
-a reason in that file and in `AGENTS.md` — an unreviewed silence is not an option.
+`cargo audit` must exit 0. The one reviewed advisory ignore lives in
+[`.cargo/audit.toml`](.cargo/audit.toml) with a written rationale, and covers only the accepted risk
+above. Adding an ignore requires a reason in that file and in `AGENTS.md` — an unreviewed silence is
+not an option.
 
 GitHub's Dependabot alerts are scored against the GitHub Advisory Database, a superset of RustSec, so
-they can list an advisory `cargo audit` never sees. The `rmcp` alerts are the four GHSA advisories in
-*Accepted risks*: they are not in RustSec, so they cannot be entries in `.cargo/audit.toml`, and the
-only version-level fix for them is the rmcp 2.x migration. The `libsqlite3-sys` alert is
-[RUSTSEC-2026-0459][rsec-0459], already an ignore.
+they can list an advisory `cargo audit` never sees. The `rmcp` and `paste` alerts were GitHub-only or
+resolved upstream by the 3.10 upgrade (see [Resolved](#resolved-by-the-rmcp-3100-upgrade) above); the
+remaining `libsqlite3-sys` alert is [RUSTSEC-2026-0459][rsec-0459], already an ignore.
 
 [rsec-0189]: https://rustsec.org/advisories/RUSTSEC-2026-0189.html
 [rsec-0459]: https://rustsec.org/advisories/RUSTSEC-2026-0459.html

@@ -24,8 +24,9 @@ a database exists, is reachable, or is misconfigured. Storage degrades; it never
 
 ## Everything else MCP offers
 
-The server implements every server-side feature rmcp 0.1.5 exposes, and advertises exactly those —
-see [MCP features](#mcp-features) for the full map and for what the pinned SDK cannot do.
+The server implements the server-side features it advertises at MCP protocol version **2025-11-25**
+(the ceiling rmcp 3.10 negotiates), and advertises exactly those — see [MCP features](#mcp-features)
+for the full map and for what the pinned SDK deliberately leaves unused.
 
 ## Requirements
 
@@ -232,7 +233,7 @@ See [`SECURITY.md`](SECURITY.md) for the threat model and the accepted risks.
 ### Smoke test without a client
 
 Build first, then keep stdin open — a cold `cargo run` compiles while stdin is already at EOF, and
-`rmcp` 0.1.5 shuts down and drops in-flight responses.
+`rmcp` shuts down and drops in-flight responses.
 
 ```bash
 cargo build
@@ -254,8 +255,8 @@ container:
 
 ## MCP features
 
-rmcp 0.1.5 exposes one `ServerHandler` hook per MCP server-side feature, and all of them are
-implemented. `initialize` advertises exactly this set — nothing more:
+rmcp 3.10 exposes one `ServerHandler` hook per MCP server-side feature, and all of the ones this
+server advertises are implemented. `initialize` advertises exactly this set — nothing more:
 
 ```json
 {"tools": {}, "prompts": {}, "resources": {"subscribe": true}, "logging": {}}
@@ -322,19 +323,23 @@ transport half is automatic; and every tool is a single atomic call returning it
 once, so there is no partial work to abandon and nothing to report progress *for*. The tests assert
 the server neither replies to nor breaks on such notifications.
 
-### What the pinned SDK cannot do
+### What this server deliberately does not advertise
 
-`rmcp` 0.1 implements MCP 2024-11-05 only, so these are unavailable rather than unimplemented, and no
-capability is advertised for them: **tool annotations** (`readOnlyHint`, `destructiveHint`, …),
-**structured tool output** (`outputSchema`/`structuredContent`), **icons**, and resource links in tool
-results — all of which arrived in 2025-03-26 and 2025-06-18.
+rmcp 3.10 negotiates up to MCP **2025-11-25**, which is this server's ceiling. The newer 2026-07-28
+revision removes `initialize` and `ping` and replaces `resources/subscribe` with
+`subscriptions/listen`; this server does not implement that lifecycle, so
+`supported_protocol_versions()` caps negotiation at 2025-11-25. A client asking for 2026-07-28 is
+answered with 2025-11-25, and a `server/discover` opener is rejected cleanly.
 
-One SDK bug is worked around rather than fixed: rmcp serialises `ResourceContents` with an
-enum-level `rename_all`, which renames the variants but not the fields inside them, so a `mimeType`
-set on a read result goes on the wire as `mime_type` — not a key in the MCP schema. The server
-therefore *omits* the optional media type on reads instead of emitting it wrongly; `resources/list`
-still carries a correct `mimeType`, because that one comes from a struct whose `rename_all` applies.
-`tests/mcp_features.rs` pins this, so an rmcp upgrade will flag it.
+Several features now exist in the SDK but are deliberately left unused, so the wire contract keeps its
+original shape: **tool annotations** (`readOnlyHint`, `destructiveHint`, …), **structured tool output**
+(`outputSchema`/`structuredContent`), **icons**, and resource links in tool results. No `*ListChanged`
+flag is advertised either: the catalogues are static, so a client would only poll for a change that
+cannot happen. Completion has no capability flag in the protocol at all.
+
+rmcp 3.x serialises `ResourceContents` with `mimeType` correctly (the enum-level `rename_all` bug of
+0.1 is fixed), so both `resources/list` and `resources/read` carry the media type.
+`tests/mcp_features.rs` pins the wire key.
 
 ## How storage behaves
 
@@ -469,10 +474,11 @@ let calculator = Calculator::new(Store::from_settings(&config.storage));
 - Arithmetic uses wrapping semantics for `i32`, so `add`/`sub`/`mul` wrap on overflow rather than
   returning an error.
 - Fire-and-forget writes can lose the last row if the process exits immediately after a tool returns.
-- `rmcp` is pinned to `0.1`, whose API differs substantially from 3.x — see `AGENTS.md`. Tool
-  annotations, structured tool output and icons are unavailable on this pin.
-- `ToolBox::list()` is backed by a `HashMap`, so `tools/list` is sorted by the server rather than
-  reported in map order; the prompt and resource catalogues keep their declaration order.
+- `rmcp` is pinned to `3.10` with the protocol ceiling at 2025-11-25 — see `AGENTS.md`. Tool
+  annotations, structured tool output and icons exist in the SDK but are deliberately unused to keep
+  the wire contract unchanged.
+- `ToolRouter::list_all()` is backed by a `HashMap`, so `tools/list` is sorted by the server rather
+  than reported in map order; the prompt and resource catalogues keep their declaration order.
 - There is no config-file discovery: a file is only read when `--config` or `MCP_CONFIG` names it.
   Longest-prefix or per-directory search would be the next step if this becomes annoying.
 - SQL Server is not supported. sqlx itself only implements PostgreSQL, MySQL and SQLite; MSSQL needs

@@ -1,31 +1,37 @@
 // SPDX-License-Identifier: BSD-3-Clause
 //! The MCP server: tools, prompts, resources, logging and completion, all over one `Calculator`.
 //!
-//! rmcp 0.1.5 exposes a hook per MCP server-side feature, and [`impl ServerHandler`] implements all
-//! of them. Two of those hooks are deliberately **hand-written** rather than macro-generated, and
-//! that is the one place where the usual rule in `AGENTS.md` is inverted — see [`ServerHandler::list_tools`].
+//! The [`impl ServerHandler`] block is hand-written. `#[tool_handler]` only fills in the methods the
+//! block does not define (here, `get_tool`), so the sorted, paginated `list_tools` and the explicit
+//! `call_tool` stay. See [`ServerHandler::list_tools`].
+
+// Logging (SEP-2577) and resource subscribe/unsubscribe (SEP-2567) are deprecated in rmcp 3.10, but
+// they are still the live mechanisms for the 2025-11-25 protocol this server advertises. Keep them
+// with their deprecation warnings silenced here rather than dropping working behaviour.
+#![allow(deprecated)]
 
 use std::{
+    borrow::Cow,
     collections::BTreeSet,
     sync::{Arc, Mutex},
 };
 
 use rmcp::{
-    ServerHandler,
-    handler::server::tool::ToolCallContext,
+    ErrorData as McpError, RoleServer, ServerHandler,
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
     model::{
-        CallToolRequestParam, CallToolResult, CompleteRequestParam, CompleteResult,
-        GetPromptRequestParam, GetPromptResult, Implementation, ListPromptsResult,
-        ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, LoggingLevel,
-        LoggingMessageNotification, LoggingMessageNotificationMethod,
-        LoggingMessageNotificationParam, PaginatedRequestParam, PaginatedRequestParamInner,
-        ReadResourceRequestParam, ReadResourceResult, Reference, ResourceUpdatedNotification,
-        ResourceUpdatedNotificationMethod, ResourceUpdatedNotificationParam, ServerCapabilities,
-        ServerInfo, ServerNotification, SubscribeRequestParam, UnsubscribeRequestParam,
+        CallToolRequestParams, CallToolResponse, CancelledNotificationParam, CompleteRequestParams,
+        CompleteResult, CompletionInfo, GetPromptRequestParams, GetPromptResponse, Implementation,
+        JsonObject, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
+        ListToolsResult, LoggingLevel, LoggingMessageNotification, LoggingMessageNotificationParam,
+        PaginatedRequestParams, ProgressNotificationParam, ProtocolVersion,
+        ReadResourceRequestParams, ReadResourceResponse, Reference, ResourceUpdatedNotification,
+        ResourceUpdatedNotificationParam, ServerCapabilities, ServerConfig, ServerNotification,
+        SetLevelRequestParams, SubscribeRequestParams, UnsubscribeRequestParams,
     },
     schemars,
-    service::{Peer, RequestContext, RoleServer},
-    tool,
+    service::{NotificationContext, Peer, RequestContext},
+    tool, tool_handler, tool_router,
 };
 
 use crate::{db::Store, prompts, resources};
@@ -73,13 +79,36 @@ pub struct HistoryRequest {
     pub limit: i64,
 }
 
+/// Two integer operands. `add`, `sub` and `mul` each use one of these; a named struct keeps the
+/// generated input schema identical to the old `#[tool(param)]` pair.
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+struct AddRequest {
+    a: i32,
+    b: i32,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+struct SubRequest {
+    a: i32,
+    b: i32,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+struct MulRequest {
+    a: i32,
+    b: i32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Calculator {
     store: Store,
-    /// The connected client, installed by rmcp when the session starts.
+    /// The tool router built once per instance by the constructors. Regenerating it per call would
+    /// rebuild every tool's schema on every `tools/list` and `tools/call`.
+    tool_router: ToolRouter<Self>,
+    /// The connected client, installed from `RequestContext::peer` in `call_tool`.
     ///
-    /// Shared with every clone because `ServerHandler` requires `Clone` and rmcp may serve
-    /// concurrent requests off one instance; whichever clone handles a request can reach the peer.
+    /// Shared with every clone because rmcp may serve concurrent requests off one instance; the
+    /// detached notification task needs a peer after the request has returned.
     peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
     /// Resource URIs this client asked to be told about, from `resources/subscribe`.
     subscriptions: Arc<Mutex<BTreeSet<String>>>,
@@ -89,7 +118,7 @@ pub struct Calculator {
     subscription_limit: usize,
 }
 
-#[tool(tool_box)]
+#[tool_router]
 impl Calculator {
     #[must_use]
     pub fn new(store: Store) -> Self {
@@ -102,6 +131,7 @@ impl Calculator {
     pub fn with_list_page_size(store: Store, list_page_size: usize) -> Self {
         Self {
             store,
+            tool_router: Self::tool_router(),
             peer: Arc::default(),
             subscriptions: Arc::default(),
             log_level: Arc::new(Mutex::new(LoggingLevel::Info)),
@@ -121,21 +151,18 @@ impl Calculator {
 
     /// Names of every tool this server exposes, sorted.
     ///
-    /// [`ToolBox::list`](rmcp::handler::server::tool::ToolBox::list) is backed by a `HashMap`, so
-    /// this sorts rather than reporting the map's arbitrary order.
+    /// `ToolRouter::list_all()` sorts, so a `HashMap`-backed router cannot leak its arbitrary order.
     #[must_use]
     pub fn tool_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = Self::tool_box()
-            .list()
+        self.tool_router
+            .list_all()
             .into_iter()
             .map(|tool| tool.name.to_string())
-            .collect();
-        names.sort_unstable();
-        names
+            .collect()
     }
 
     #[tool(description = "Add two integers")]
-    async fn add(&self, #[tool(param)] a: i32, #[tool(param)] b: i32) -> String {
+    async fn add(&self, Parameters(AddRequest { a, b }): Parameters<AddRequest>) -> String {
         let sum = a.wrapping_add(b);
         self.recorded_success(
             "add",
@@ -146,7 +173,7 @@ impl Calculator {
     }
 
     #[tool(description = "Subtract the second integer from the first")]
-    async fn sub(&self, #[tool(param)] a: i32, #[tool(param)] b: i32) -> String {
+    async fn sub(&self, Parameters(SubRequest { a, b }): Parameters<SubRequest>) -> String {
         let difference = a.wrapping_sub(b);
         self.recorded_success(
             "sub",
@@ -157,7 +184,7 @@ impl Calculator {
     }
 
     #[tool(description = "Multiply two integers")]
-    async fn mul(&self, #[tool(param)] a: i32, #[tool(param)] b: i32) -> String {
+    async fn mul(&self, Parameters(MulRequest { a, b }): Parameters<MulRequest>) -> String {
         let product = a.wrapping_mul(b);
         self.recorded_success(
             "mul",
@@ -168,7 +195,10 @@ impl Calculator {
     }
 
     #[tool(description = "Divide two floats")]
-    async fn div(&self, #[tool(aggr)] request: DivisionRequest) -> Result<String, String> {
+    async fn div(
+        &self,
+        Parameters(request): Parameters<DivisionRequest>,
+    ) -> Result<String, String> {
         let inputs = serde_json::json!({
             "dividend": request.dividend,
             "divisor": request.divisor,
@@ -194,7 +224,10 @@ impl Calculator {
     }
 
     #[tool(description = "List previously recorded calculations, most recent first")]
-    async fn calc_history(&self, #[tool(aggr)] request: HistoryRequest) -> Result<String, String> {
+    async fn calc_history(
+        &self,
+        Parameters(request): Parameters<HistoryRequest>,
+    ) -> Result<String, String> {
         let limit = clamp_history_limit(request.limit, self.store.max_history_rows());
         let entries = self.store.list(limit).await?;
         if entries.is_empty() {
@@ -259,25 +292,23 @@ impl Calculator {
 
         tokio::spawn(async move {
             if send_log {
-                let log =
-                    ServerNotification::LoggingMessageNotification(LoggingMessageNotification {
-                        method: LoggingMessageNotificationMethod,
-                        params: LoggingMessageNotificationParam {
-                            level: LoggingLevel::Info,
-                            logger: Some(LOGGER.to_owned()),
-                            data: serde_json::json!(message),
-                        },
-                    });
+                let log = ServerNotification::LoggingMessageNotification(
+                    LoggingMessageNotification::new(
+                        LoggingMessageNotificationParam::new(
+                            LoggingLevel::Info,
+                            serde_json::json!(message),
+                        )
+                        .with_logger(LOGGER),
+                    ),
+                );
                 if let Err(error) = peer.send_notification(log).await {
                     tracing::debug!(%error, "could not send log notification");
                 }
             }
             for uri in invalidated {
-                let updated =
-                    ServerNotification::ResourceUpdatedNotification(ResourceUpdatedNotification {
-                        method: ResourceUpdatedNotificationMethod,
-                        params: ResourceUpdatedNotificationParam { uri },
-                    });
+                let updated = ServerNotification::ResourceUpdatedNotification(
+                    ResourceUpdatedNotification::new(ResourceUpdatedNotificationParam::new(uri)),
+                );
                 if let Err(error) = peer.send_notification(updated).await {
                     tracing::debug!(%error, "could not send resource-updated notification");
                 }
@@ -296,11 +327,7 @@ impl Calculator {
 
     /// Whether a notification at `level` passes the level from `logging/setLevel`.
     fn level_enabled(&self, level: LoggingLevel) -> bool {
-        let configured = self
-            .log_level
-            .lock()
-            .expect("log level mutex poisoned")
-            .clone();
+        let configured = *self.log_level.lock().expect("log level mutex poisoned");
         rank(level) >= rank(configured)
     }
 }
@@ -330,13 +357,13 @@ const fn rank(level: LoggingLevel) -> u8 {
 /// Returns `invalid_params` for a cursor that is not a plain index.
 fn page<T: Clone>(
     items: &[T],
-    params: Option<&PaginatedRequestParamInner>,
+    params: Option<&PaginatedRequestParams>,
     page_size: usize,
-) -> Result<(Vec<T>, Option<String>), rmcp::Error> {
+) -> Result<(Vec<T>, Option<String>), McpError> {
     let start = match params.and_then(|params| params.cursor.as_deref()) {
         None => 0,
         Some(cursor) => cursor.parse::<usize>().map_err(|_| {
-            rmcp::Error::invalid_params(format!("cursor {cursor:?} is not a valid cursor"), None)
+            McpError::invalid_params(format!("cursor {cursor:?} is not a valid cursor"), None)
         })?,
     };
     let remaining = items.get(start..).unwrap_or_default();
@@ -345,95 +372,125 @@ fn page<T: Clone>(
     Ok((page.to_vec(), next_cursor))
 }
 
-// NOTE: this block is deliberately *not* annotated `#[tool(tool_box)]`.
-//
-// That annotation unconditionally generates `list_tools` and `call_tool`, so hand-writing them
-// alongside it is a duplicate-definition error. Both are written out here instead, because
-// `list_tools` needs two things the generated one cannot do: sort the `HashMap`-backed tool box, and
-// paginate. `call_tool` is exactly the macro's body, restated so the two stay visibly paired — if
-// this ever compiles without a `list_tools`, tools are silently invisible, so keep them together.
+/// Deserialise a tool's arguments into its declared request type before the router sees them.
+///
+/// rmcp 3.x's router deliberately rewrites argument-deserialisation failures into tool-level errors
+/// (`isError: true`). This server's contract, unchanged from 0.1, is that a client sending the wrong
+/// JSON *type* is a protocol error (`invalid_params`), while a well-formed call whose *operation*
+/// fails (division by zero) is a tool error. Validating here keeps that split: only the first case
+/// is intercepted, and the router still handles unknown names and no-argument tools.
+fn validate_tool_arguments(name: &str, arguments: Option<&JsonObject>) -> Result<(), McpError> {
+    let Some(arguments) = arguments else {
+        return Ok(());
+    };
+    let value = serde_json::Value::Object(arguments.clone());
+    let parsed = match name {
+        "add" => serde_json::from_value::<AddRequest>(value).map(|_| ()),
+        "sub" => serde_json::from_value::<SubRequest>(value).map(|_| ()),
+        "mul" => serde_json::from_value::<MulRequest>(value).map(|_| ()),
+        "div" => serde_json::from_value::<DivisionRequest>(value).map(|_| ()),
+        "calc_history" => serde_json::from_value::<HistoryRequest>(value).map(|_| ()),
+        // No-argument tools and unknown names are left to the router (which reports the latter).
+        _ => Ok(()),
+    };
+    parsed.map_err(|error| {
+        McpError::invalid_params(format!("failed to deserialize parameters: {error}"), None)
+    })
+}
+
+// `#[tool_handler]` only generates methods this block does not define, so `get_tool` comes from the
+// router while `list_tools`, `call_tool` and `get_info` stay hand-written. `list_tools` sorts and
+// paginates, which the generated version cannot; `call_tool` installs the peer before dispatch.
+#[tool_handler]
 impl ServerHandler for Calculator {
     async fn list_tools(
         &self,
-        params: PaginatedRequestParam,
+        params: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, rmcp::Error> {
-        let mut tools = Self::tool_box().list();
+    ) -> Result<ListToolsResult, McpError> {
+        let mut tools = self.tool_router.list_all();
         tools.sort_unstable_by(|left, right| left.name.cmp(&right.name));
         let (tools, next_cursor) = page(&tools, params.as_ref(), self.list_page_size)?;
-        Ok(ListToolsResult { tools, next_cursor })
+        let mut result = ListToolsResult::with_all_items(tools);
+        result.next_cursor = next_cursor;
+        Ok(result)
     }
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParam,
+        request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::Error> {
+    ) -> Result<CallToolResponse, McpError> {
+        // The peer lives on the context in 3.x. Keep a clone so detached notification tasks can
+        // still reach it after this request returns.
+        *self.peer.lock().expect("peer mutex poisoned") = Some(context.peer.clone());
+        // 3.x's router turns argument-deserialisation failures into tool errors (`isError: true`).
+        // Pre-validate here so a client that sends the wrong JSON type still gets the JSON-RPC
+        // `invalid_params` it got before the upgrade; a valid request whose operation fails (e.g.
+        // division by zero) still reaches the tool and stays a tool error.
+        validate_tool_arguments(&request.name, request.arguments.as_ref())?;
         let context = ToolCallContext::new(self, request, context);
-        Self::tool_box().call(context).await
+        self.tool_router.call(context).await
     }
 
     async fn list_prompts(
         &self,
-        params: PaginatedRequestParam,
+        params: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListPromptsResult, rmcp::Error> {
+    ) -> Result<ListPromptsResult, McpError> {
         let catalogue = prompts::list();
         let (prompts, next_cursor) = page(&catalogue, params.as_ref(), self.list_page_size)?;
-        Ok(ListPromptsResult {
-            prompts,
-            next_cursor,
-        })
+        let mut result = ListPromptsResult::with_all_items(prompts);
+        result.next_cursor = next_cursor;
+        Ok(result)
     }
 
     async fn get_prompt(
         &self,
-        request: GetPromptRequestParam,
+        request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, rmcp::Error> {
-        prompts::get(&request.name, request.arguments.as_ref())
+    ) -> Result<GetPromptResponse, McpError> {
+        Ok(prompts::get(&request.name, request.arguments.as_ref())?.into())
     }
 
     async fn list_resources(
         &self,
-        params: PaginatedRequestParam,
+        params: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourcesResult, rmcp::Error> {
+    ) -> Result<ListResourcesResult, McpError> {
         let catalogue = resources::list();
         let (resources, next_cursor) = page(&catalogue, params.as_ref(), self.list_page_size)?;
-        Ok(ListResourcesResult {
-            resources,
-            next_cursor,
-        })
+        let mut result = ListResourcesResult::with_all_items(resources);
+        result.next_cursor = next_cursor;
+        Ok(result)
     }
 
     async fn list_resource_templates(
         &self,
-        params: PaginatedRequestParam,
+        params: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourceTemplatesResult, rmcp::Error> {
+    ) -> Result<ListResourceTemplatesResult, McpError> {
         let catalogue = resources::templates();
         let (resource_templates, next_cursor) =
             page(&catalogue, params.as_ref(), self.list_page_size)?;
-        Ok(ListResourceTemplatesResult {
-            resource_templates,
-            next_cursor,
-        })
+        let mut result = ListResourceTemplatesResult::with_all_items(resource_templates);
+        result.next_cursor = next_cursor;
+        Ok(result)
     }
 
     async fn read_resource(
         &self,
-        request: ReadResourceRequestParam,
+        request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, rmcp::Error> {
-        resources::read(&self.store, &request.uri).await
+    ) -> Result<ReadResourceResponse, McpError> {
+        Ok(resources::read(&self.store, &request.uri).await?.into())
     }
 
     async fn subscribe(
         &self,
-        request: SubscribeRequestParam,
+        request: SubscribeRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<(), rmcp::Error> {
+    ) -> Result<(), McpError> {
         // Refuse a URI this server does not serve rather than accepting a subscription that could
         // never fire: a silent no-op subscription is worse than an error the client can act on.
         resources::parse(&request.uri)?;
@@ -445,7 +502,7 @@ impl ServerHandler for Calculator {
             if !subscriptions.contains(&request.uri)
                 && subscriptions.len() >= self.subscription_limit
             {
-                return Err(rmcp::Error::invalid_params(
+                return Err(McpError::invalid_params(
                     "too many resource subscriptions",
                     None,
                 ));
@@ -458,9 +515,9 @@ impl ServerHandler for Calculator {
 
     async fn unsubscribe(
         &self,
-        request: UnsubscribeRequestParam,
+        request: UnsubscribeRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<(), rmcp::Error> {
+    ) -> Result<(), McpError> {
         // Unsubscribing something never subscribed is a no-op, not an error: the client's intent —
         // "stop telling me" — is satisfied either way.
         self.subscriptions
@@ -473,18 +530,18 @@ impl ServerHandler for Calculator {
 
     async fn set_level(
         &self,
-        request: rmcp::model::SetLevelRequestParam,
+        request: SetLevelRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<(), rmcp::Error> {
-        *self.log_level.lock().expect("log level mutex poisoned") = request.level.clone();
+    ) -> Result<(), McpError> {
+        *self.log_level.lock().expect("log level mutex poisoned") = request.level;
         Ok(())
     }
 
     async fn complete(
         &self,
-        request: CompleteRequestParam,
+        request: CompleteRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CompleteResult, rmcp::Error> {
+    ) -> Result<CompleteResult, McpError> {
         let reference = &request.r#ref;
         let values = match reference {
             Reference::Prompt(reference) => prompts::completions(
@@ -501,16 +558,22 @@ impl ServerHandler for Calculator {
                 )
                 .await?
             }
+            // `Reference` is non-exhaustive in 3.x; a future variant must fail loudly rather than
+            // complete against the wrong catalogue.
+            _ => {
+                return Err(McpError::invalid_params(
+                    "unsupported completion reference",
+                    None,
+                ));
+            }
         };
-        // `hasMore: false` because every list here is filtered in full; `total` is left unset so a
-        // client cannot mistake "everything matching the prefix" for "everything that exists".
-        Ok(CompleteResult {
-            completion: rmcp::model::CompletionInfo {
-                total: Some(values.len() as u32),
-                values,
-                has_more: Some(false),
-            },
-        })
+        // `hasMore: false` because every list here is filtered in full; `total` reports the size of
+        // the filtered set, not of the whole catalogue.
+        let mut completion = CompletionInfo::default();
+        completion.total = Some(values.len() as u32);
+        completion.values = values;
+        completion.has_more = Some(false);
+        Ok(CompleteResult::new(completion))
     }
 
     /// Progress and cancellation are accepted and deliberately do nothing here.
@@ -521,7 +584,11 @@ impl ServerHandler for Calculator {
     /// at once, so there is no partial work to abandon and nothing to report progress *for*. These
     /// hooks exist so that is a decision on record rather than an omission; the tests assert the
     /// server neither replies to nor breaks on such notifications.
-    async fn on_cancelled(&self, notification: rmcp::model::CancelledNotificationParam) {
+    async fn on_cancelled(
+        &self,
+        notification: CancelledNotificationParam,
+        _context: NotificationContext<RoleServer>,
+    ) {
         tracing::debug!(
             id = ?notification.request_id,
             reason = ?notification.reason,
@@ -529,43 +596,47 @@ impl ServerHandler for Calculator {
         );
     }
 
-    async fn on_progress(&self, _notification: rmcp::model::ProgressNotificationParam) {}
-
-    fn get_peer(&self) -> Option<Peer<RoleServer>> {
-        self.peer()
+    async fn on_progress(
+        &self,
+        _notification: ProgressNotificationParam,
+        _context: NotificationContext<RoleServer>,
+    ) {
     }
 
-    fn set_peer(&mut self, peer: Peer<RoleServer>) {
-        *self.peer.lock().expect("peer mutex poisoned") = Some(peer);
+    /// Only advertise the revisions whose session lifecycle this handler implements. 2026-07-28
+    /// removes `initialize` and `ping` and replaces subscriptions with `subscriptions/listen`, none
+    /// of which exist here.
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(ProtocolVersion::known_up_to(&ProtocolVersion::V_2025_11_25))
     }
 
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: Default::default(),
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             // Every capability advertised here is implemented above. Notably absent:
             // `*ListChanged`, because the tool, prompt and resource catalogues are all static —
             // claiming otherwise would make clients poll for a change that cannot happen. And
-            // completions, which the spec defines no capability flag for.
-            capabilities: ServerCapabilities::builder()
+            // completions, which the spec defines no capability flag for. Logging is deprecated by
+            // SEP-2577 but remains the mechanism for `logging/setLevel` at this protocol ceiling.
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
                 .enable_resources()
                 .enable_resources_subscribe()
                 .enable_logging()
                 .build(),
-            server_info: Implementation {
-                name: env!("CARGO_PKG_NAME").to_owned(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-            },
-            instructions: Some(
-                "A calculator server. Every arithmetic call is recorded to the configured \
-                 database (PostgreSQL, MySQL/MariaDB or SQLite) when DATABASE_URL is set; use \
-                 db_status, calc_history and clear_calc_history to inspect storage, or read the \
-                 calc://history resource to pull the whole log into context. Subscribe to \
-                 calc://history to be told when it changes."
-                    .to_owned(),
-            ),
-        }
+        )
+        .with_protocol_version(ProtocolVersion::V_2025_11_25)
+        .with_server_info(Implementation::new(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(
+            "A calculator server. Every arithmetic call is recorded to the configured \
+             database (PostgreSQL, MySQL/MariaDB or SQLite) when DATABASE_URL is set; use \
+             db_status, calc_history and clear_calc_history to inspect storage, or read the \
+             calc://history resource to pull the whole log into context. Subscribe to \
+             calc://history to be told when it changes.",
+        )
     }
 }
 

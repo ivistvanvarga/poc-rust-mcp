@@ -8,7 +8,7 @@ license = "BSD-3-Clause"
 authors = ["iv.istvan.varga <iv.istvan.varga@gmail.com>"]
 
 [dependencies]
-rmcp = { version = "0.1", features = [
+rmcp = { version = "3.10.0", features = [
     "server",
     "transport-io",
 ] }

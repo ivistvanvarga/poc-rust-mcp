@@ -99,8 +99,8 @@ async fn serve_sse(server: &ServerConfig, store: Store) -> Result<()> {
         "sse server ready"
     );
 
-    // A fresh `Calculator` per session, so each client's subscriptions and log level stay its own:
-    // rmcp installs that session's peer on it.
+    // A fresh `Calculator` per session, so each client's subscriptions and log level stay its own;
+    // the peer for notifications is picked up from the request context on the first tool call.
     poc_rust_mcp::sse::serve(
         listener,
         settings,

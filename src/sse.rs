@@ -1,8 +1,8 @@
-//! The SSE transport, with the request validation rmcp 0.1.5 does not do.
+//! The SSE transport, with the request validation rmcp's own transports do not do.
 //!
-//! rmcp's own `transport-sse-server` accepts every request: no token, no `Host` check, no `Origin`
-//! check, and an unbounded session map. That is unusable for anything listening beyond loopback,
-//! and it is why this module exists. The MCP framing is unchanged — the endpoint event, the
+//! rmcp's server transports perform no `Host`, `Origin` or bearer-token validation. That is
+//! unusable for anything listening beyond loopback, and it is why this module exists. The MCP
+//! framing is unchanged — the endpoint event, the
 //! `POST /message?sessionId=…` contract, `Sse`/`KeepAlive` — but every request passes through
 //! [`authorize`] first, and sessions are bounded and cleaned up.
 //!

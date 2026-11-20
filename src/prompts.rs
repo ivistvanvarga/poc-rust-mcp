@@ -11,10 +11,9 @@
 //! producing a subtly wrong message.
 
 use rmcp::{
-    Error as McpError,
+    ErrorData as McpError,
     model::{
-        GetPromptResult, JsonObject, Prompt, PromptArgument, PromptMessage, PromptMessageContent,
-        PromptMessageRole,
+        ContentBlock, GetPromptResult, JsonObject, Prompt, PromptArgument, PromptMessage, Role,
     },
 };
 
@@ -47,15 +46,14 @@ pub fn list() -> Vec<Prompt> {
                  Optionally narrowed to a single operation."
                     .to_owned(),
             ),
-            Some(vec![PromptArgument {
-                name: OPERATION_ARGUMENT.to_owned(),
-                description: Some(
-                    "Restrict the review to one operation: add, sub, mul or div. Omit for all of \
-                     them."
-                        .to_owned(),
-                ),
-                required: Some(false),
-            }]),
+            Some(vec![
+                PromptArgument::new(OPERATION_ARGUMENT)
+                    .with_description(
+                        "Restrict the review to one operation: add, sub, mul or div. Omit for all of \
+                         them.",
+                    )
+                    .with_required(false),
+            ]),
         ),
         Prompt::new(
             CHECK_STORAGE,
@@ -150,13 +148,10 @@ pub fn names() -> Vec<&'static str> {
 
 /// One user message, which is what every prompt here produces: the model is the one doing the work.
 fn user_prompt(text: String) -> GetPromptResult {
-    GetPromptResult {
-        description: None,
-        messages: vec![PromptMessage {
-            role: PromptMessageRole::User,
-            content: PromptMessageContent::text(text),
-        }],
-    }
+    GetPromptResult::new(vec![PromptMessage::new(
+        Role::User,
+        ContentBlock::text(text),
+    )])
 }
 
 /// Reject any argument this prompt does not declare, which is how a misspelled argument is caught.

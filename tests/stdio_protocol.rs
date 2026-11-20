@@ -15,7 +15,6 @@ use std::time::Duration;
 use serde_json::json;
 use support::{DEAD_DATABASE_URL, PROTOCOL_VERSION, Server};
 
-/// The MCP revision implemented by rmcp 0.1.5.
 /// Capability keys the server advertises at the top level of `initialize`. Nested flags —
 /// `resources.subscribe`, and the `listChanged` flags — are asserted separately below.
 const SERVER_CAPABILITIES: [&str; 4] = ["tools", "prompts", "resources", "logging"];
@@ -26,8 +25,8 @@ async fn initialize_advertises_tools_capability_and_real_server_identity() {
     let result = server.initialize_result();
 
     assert_eq!(result["protocolVersion"], json!(PROTOCOL_VERSION));
-    // `ServerInfo::default()` from rmcp would report name "rmcp" and `"capabilities": {}`, which
-    // makes clients see zero tools.
+    // `Implementation::default()` from rmcp would report the SDK's own name and empty capabilities,
+    // which makes clients see zero tools.
     assert_eq!(result["serverInfo"]["name"], env!("CARGO_PKG_NAME"));
     assert_eq!(result["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
     assert!(

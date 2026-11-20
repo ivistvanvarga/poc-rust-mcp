@@ -7,7 +7,7 @@
 //! one place; each test binary compiles its own copy, which is how Cargo integration tests work.
 //!
 //! Two transport quirks this file exists to protect against:
-//!   * rmcp 0.1.5 answers the request, so a test must read each response *before* closing stdin;
+//!   * rmcp answers the request, so a test must read each response *before* closing stdin;
 //!     dropping stdin makes the server shut down and silently drop in-flight responses.
 //!   * Any non-JSON byte on the server's stdout (or on this side's stdin) corrupts the stream, so
 //!     stdout is asserted to be pure JSON.
@@ -19,8 +19,9 @@
 use std::{process::Stdio, time::Duration};
 
 use rmcp::{
-    model::{ClientInfo, Implementation, InitializeRequestParam},
-    service::{AtomicU32RequestIdProvider, Peer, RequestContext, RoleServer},
+    ServerHandler,
+    model::RequestId,
+    service::{RequestContext, RoleServer, serve_directly},
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -35,7 +36,8 @@ pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// `DATABASE_URL` pointing at a port nothing listens on.
 pub const DEAD_DATABASE_URL: &str = "postgres://mcp:mcp@127.0.0.1:1/mcp";
 
-/// The MCP revision implemented by rmcp 0.1.5.
+/// The MCP revision the test harness asks for. The server negotiates it from the range it advertises
+/// (ceiling 2025-11-25), so this literal stays old while the ceiling moves forward.
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// How long to wait after a round-trip for detached tasks to enqueue. Comfortably longer than a
@@ -340,33 +342,21 @@ pub fn cursor(cursor: Option<&str>) -> Value {
     }
 }
 
-/// A `RequestContext` for calling a handler directly, without a transport.
+/// A `RequestContext` for calling a handler directly, without a real client.
 ///
-/// Every rmcp handler takes one, and constructing it needs a `Peer`. The peer built here is
-/// *disconnected* — the outbound half of `Peer::new` is dropped — so any attempt to send through it
-/// fails immediately. That is exactly the "no client attached" case, and it is the right one for
-/// these tests: they exercise handler logic, not delivery.
+/// In 3.x `Peer::new` is crate-private and `RequestContext` is non-exhaustive, so the context comes
+/// from `RequestContext::new` with a peer borrowed off a throwaway in-process service. No client is
+/// attached to the other end: these tests exercise handler logic, not delivery, and sends through
+/// the peer fail harmlessly. The service handle is leaked so the peer stays valid for the process.
 pub fn request_context() -> RequestContext<RoleServer> {
-    RequestContext {
-        ct: tokio_util::sync::CancellationToken::new(),
-        id: rmcp::model::RequestId::Number(0),
-        peer: Peer::new(
-            std::sync::Arc::new(AtomicU32RequestIdProvider::default()),
-            client_info(),
-        )
-        .0,
-    }
-}
+    struct Noop;
+    impl ServerHandler for Noop {}
 
-fn client_info() -> ClientInfo {
-    InitializeRequestParam {
-        protocol_version: Default::default(),
-        capabilities: Default::default(),
-        client_info: Implementation {
-            name: "integration-test".to_owned(),
-            version: "0.0.1".to_owned(),
-        },
-    }
+    let (reader, writer) = tokio::io::duplex(256);
+    let running = serve_directly::<RoleServer, Noop, _, _, _>(Noop, (reader, writer), None);
+    let peer = running.peer().clone();
+    std::mem::forget(running);
+    RequestContext::new(RequestId::Number(0), peer)
 }
 
 pub fn initialize_params() -> Value {

@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
+// Logging and resource subscription are deprecated by SEP-2577/SEP-2567 but are the live mechanisms
+// for the 2025-11-25 protocol ceiling this server advertises. These tests cover them directly.
+#![allow(deprecated)]
+
 //! The `Calculator`: its tools, its `ServerHandler` hooks, and its page size.
 //!
 //! Relocated here from `src/server.rs`, with one deliberate rewrite: the tool functions are
@@ -20,9 +24,8 @@ use poc_rust_mcp::{
 use rmcp::{
     ServerHandler,
     model::{
-        ArgumentInfo, CallToolRequestParam, CompleteRequestParam, ListToolsResult, LoggingLevel,
-        PaginatedRequestParam, PaginatedRequestParamInner, PromptReference, Reference,
-        ResourceReference, SubscribeRequestParam,
+        ArgumentInfo, CallToolRequestParams, CallToolResponse, CompleteRequestParams,
+        ListToolsResult, LoggingLevel, PaginatedRequestParams, Reference, SubscribeRequestParams,
     },
 };
 use serde_json::{Value, json};
@@ -52,55 +55,44 @@ async fn call(calculator: &Calculator, name: &str, arguments: Value) -> String {
 }
 
 /// A `tools/call` request in the shape rmcp expects.
-fn call_param(name: &str, arguments: Value) -> CallToolRequestParam {
-    CallToolRequestParam {
-        name: Cow::Owned(name.to_owned()),
-        arguments: Some(
-            arguments
-                .as_object()
-                .expect("tool arguments must be a JSON object")
-                .clone(),
-        ),
-    }
+fn call_param(name: &str, arguments: Value) -> CallToolRequestParams {
+    CallToolRequestParams::new(Cow::Owned(name.to_owned())).with_arguments(
+        arguments
+            .as_object()
+            .expect("tool arguments must be a JSON object")
+            .clone(),
+    )
 }
 
-/// Call a tool and return the whole `CallToolResult`, error content included.
+/// Call a tool and return the whole result, error content included.
 async fn call_result(calculator: &Calculator, name: &str, arguments: Value) -> Value {
-    let result = calculator
+    let response = calculator
         .call_tool(call_param(name, arguments), request_context())
         .await
         .expect("a known tool should dispatch");
+    // 3.x wraps the tool result in a response enum; the wire shape lives in the `Complete` variant.
+    let CallToolResponse::Complete(result) = response else {
+        panic!("a calculator tool must return a complete result");
+    };
     serde_json::to_value(result).expect("a tool result must serialise")
 }
 
-fn cursor(cursor: &str) -> PaginatedRequestParam {
-    Some(PaginatedRequestParamInner {
-        cursor: Some(cursor.to_owned()),
-    })
+fn cursor(cursor: &str) -> Option<PaginatedRequestParams> {
+    Some(PaginatedRequestParams::default().with_cursor(Some(cursor.to_owned())))
 }
 
-fn prompt_ref(name: &str, argument: &str, value: &str) -> CompleteRequestParam {
-    CompleteRequestParam {
-        r#ref: Reference::Prompt(PromptReference {
-            name: name.to_owned(),
-        }),
-        argument: ArgumentInfo {
-            name: argument.to_owned(),
-            value: value.to_owned(),
-        },
-    }
+fn prompt_ref(name: &str, argument: &str, value: &str) -> CompleteRequestParams {
+    CompleteRequestParams::new(
+        Reference::for_prompt(name),
+        ArgumentInfo::new(argument, value),
+    )
 }
 
-fn resource_ref(uri: &str, argument: &str, value: &str) -> CompleteRequestParam {
-    CompleteRequestParam {
-        r#ref: Reference::Resource(ResourceReference {
-            uri: uri.to_owned(),
-        }),
-        argument: ArgumentInfo {
-            name: argument.to_owned(),
-            value: value.to_owned(),
-        },
-    }
+fn resource_ref(uri: &str, argument: &str, value: &str) -> CompleteRequestParams {
+    CompleteRequestParams::new(
+        Reference::for_resource(uri),
+        ArgumentInfo::new(argument, value),
+    )
 }
 
 fn tool_names(result: &ListToolsResult) -> Vec<&str> {
@@ -175,6 +167,42 @@ fn tool_names_are_sorted_and_complete() {
             "sub",
         ]
     );
+}
+
+/// The `Parameters<T>` rewrite in the rmcp 3.x migration must not move a tool's wire contract.
+/// This pins the advertised input schemas against the shapes the 0.1 tool macros produced.
+#[tokio::test]
+async fn tool_input_schemas_are_unchanged() {
+    let tools = calculator()
+        .list_tools(None, request_context())
+        .await
+        .expect("listing tools should succeed")
+        .tools;
+
+    let expected: &[(&str, &[(&str, &str)])] = &[
+        ("add", &[("a", "integer"), ("b", "integer")]),
+        ("sub", &[("a", "integer"), ("b", "integer")]),
+        ("mul", &[("a", "integer"), ("b", "integer")]),
+        ("div", &[("dividend", "number"), ("divisor", "number")]),
+        ("calc_history", &[("limit", "integer")]),
+    ];
+    for (name, properties) in expected {
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == *name)
+            .unwrap_or_else(|| panic!("tool {name} is missing from the catalogue"));
+        let schema = serde_json::to_value(&*tool.input_schema).expect("a schema must serialise");
+        assert_eq!(schema["type"], json!("object"), "schema for {name}");
+        for (property, ty) in *properties {
+            assert_eq!(
+                schema["properties"][property]["type"],
+                json!(ty),
+                "property {property} of {name}"
+            );
+        }
+        let required: Vec<&str> = properties.iter().map(|(property, _)| *property).collect();
+        assert_eq!(schema["required"], json!(required), "required of {name}");
+    }
 }
 
 #[test]
@@ -306,9 +334,7 @@ async fn subscribing_is_refused_for_a_resource_this_server_does_not_serve() {
     // Accepting a subscription that could never fire is a silent no-op the client cannot detect.
     let error = calculator()
         .subscribe(
-            SubscribeRequestParam {
-                uri: "file:///etc/passwd".to_owned(),
-            },
+            SubscribeRequestParams::new("file:///etc/passwd"),
             request_context(),
         )
         .await
@@ -321,30 +347,21 @@ async fn subscriptions_are_capped_per_client() {
     let calculator = Calculator::new(Store::disabled()).with_subscription_limit(2);
     for uri in [resources::HISTORY_URI, "calc://history/1"] {
         calculator
-            .subscribe(
-                SubscribeRequestParam {
-                    uri: uri.to_owned(),
-                },
-                request_context(),
-            )
+            .subscribe(SubscribeRequestParams::new(uri), request_context())
             .await
             .expect("within the cap");
     }
     // Re-subscribing to the same URI is free.
     calculator
         .subscribe(
-            SubscribeRequestParam {
-                uri: resources::HISTORY_URI.to_owned(),
-            },
+            SubscribeRequestParams::new(resources::HISTORY_URI),
             request_context(),
         )
         .await
         .expect("duplicate subscription");
     let error = calculator
         .subscribe(
-            SubscribeRequestParam {
-                uri: "calc://history/2".to_owned(),
-            },
+            SubscribeRequestParams::new("calc://history/2"),
             request_context(),
         )
         .await
@@ -356,9 +373,7 @@ async fn subscriptions_are_capped_per_client() {
 async fn unsubscribing_something_never_subscribed_is_not_an_error() {
     calculator()
         .unsubscribe(
-            rmcp::model::UnsubscribeRequestParam {
-                uri: resources::HISTORY_URI.to_owned(),
-            },
+            rmcp::model::UnsubscribeRequestParams::new(resources::HISTORY_URI),
             request_context(),
         )
         .await
@@ -422,7 +437,7 @@ fn log_levels_rank_in_the_order_syslog_defines() {
     ];
     for pair in ordered.windows(2) {
         assert!(
-            testing::rank(pair[0].clone()) < testing::rank(pair[1].clone()),
+            testing::rank(pair[0]) < testing::rank(pair[1]),
             "{:?} should rank below {:?}",
             pair[0],
             pair[1]
@@ -441,9 +456,7 @@ async fn set_level_drops_notifications_below_it() {
 
     calculator
         .set_level(
-            rmcp::model::SetLevelRequestParam {
-                level: LoggingLevel::Error,
-            },
+            rmcp::model::SetLevelRequestParams::new(LoggingLevel::Error),
             request_context(),
         )
         .await

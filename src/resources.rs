@@ -21,11 +21,8 @@
 //! behind it, is a `resource_not_found`.
 
 use rmcp::{
-    Error as McpError,
-    model::{
-        RawResource, RawResourceTemplate, ReadResourceResult, Resource, ResourceContents,
-        ResourceTemplate,
-    },
+    ErrorData as McpError,
+    model::{ReadResourceResult, Resource, ResourceContents, ResourceTemplate},
 };
 
 use crate::{
@@ -62,20 +59,14 @@ pub const NO_HISTORY: &str = "no calculations recorded yet";
 /// The resource list, in a stable order.
 #[must_use]
 pub fn list() -> Vec<Resource> {
-    vec![Resource::new(
-        RawResource {
-            uri: HISTORY_URI.to_owned(),
-            name: "calculation-history".to_owned(),
-            description: Some(
+    vec![
+        Resource::new(HISTORY_URI, "calculation-history")
+            .with_description(
                 "Every recorded calculator call, most recent first, one per line. Empty when \
-                 storage is unavailable — the content says so."
-                    .to_owned(),
-            ),
-            mime_type: Some(MIME_TYPE.to_owned()),
-            size: None,
-        },
-        None,
-    )]
+             storage is unavailable — the content says so.",
+            )
+            .with_mime_type(MIME_TYPE),
+    ]
 }
 
 /// The resource templates, in a stable order.
@@ -83,31 +74,21 @@ pub fn list() -> Vec<Resource> {
 pub fn templates() -> Vec<ResourceTemplate> {
     vec![
         ResourceTemplate::new(
-            RawResourceTemplate {
-                uri_template: format!("{OPERATION_URI_PREFIX}{{operation}}"),
-                name: "calculation-history-by-operation".to_owned(),
-                description: Some(format!(
-                    "Recorded calculator calls narrowed to one operation ({}) and identified by \
-                     name, e.g. {OPERATION_URI_PREFIX}add.",
-                    OPERATIONS.join(", ")
-                )),
-                mime_type: Some(MIME_TYPE.to_owned()),
-            },
-            None,
-        ),
-        ResourceTemplate::new(
-            RawResourceTemplate {
-                uri_template: "calc://history/{id}".to_owned(),
-                name: "calculation-history-by-id".to_owned(),
-                description: Some(
-                    "One recorded calculator call, identified by id, e.g. calc://history/7. Only \
-                     ids within the recent-history window are addressable."
-                        .to_owned(),
-                ),
-                mime_type: Some(MIME_TYPE.to_owned()),
-            },
-            None,
-        ),
+            format!("{OPERATION_URI_PREFIX}{{operation}}"),
+            "calculation-history-by-operation",
+        )
+        .with_description(format!(
+            "Recorded calculator calls narrowed to one operation ({}) and identified by \
+             name, e.g. {OPERATION_URI_PREFIX}add.",
+            OPERATIONS.join(", ")
+        ))
+        .with_mime_type(MIME_TYPE),
+        ResourceTemplate::new("calc://history/{id}", "calculation-history-by-id")
+            .with_description(
+                "One recorded calculator call, identified by id, e.g. calc://history/7. Only \
+                 ids within the recent-history window are addressable.",
+            )
+            .with_mime_type(MIME_TYPE),
     ]
 }
 
@@ -253,23 +234,12 @@ fn render<'a>(entries: impl IntoIterator<Item = &'a HistoryEntry>) -> String {
 
 /// A single text body for `uri`.
 ///
-/// `mimeType` is deliberately **omitted** here, even though the catalogue advertises it. rmcp 0.1.5
-/// serialises [`ResourceContents`] with an enum-level `rename_all`, which renames the variants but
-/// not the fields inside them, so any value set here goes on the wire as `mime_type` — not a key in
-/// the MCP schema, and not one a strict client would recognise. `mimeType` is optional in the spec,
-/// so omitting it is correct where emitting it would not be. The listing still carries a proper
-/// `mimeType`, because that comes from a struct whose `rename_all` does apply.
-///
-/// See `AGENTS.md`; this is a bug in the pinned SDK, not something this crate can work around
-/// properly, and it disappears when rmcp is upgraded.
+/// rmcp 3.x serialises [`ResourceContents`] with `mimeType`, so the media type advertised in the
+/// catalogue can now be emitted on reads too. `tests/mcp_features.rs` pins the wire key.
 fn text(uri: &str, body: &str) -> ReadResourceResult {
-    ReadResourceResult {
-        contents: vec![ResourceContents::TextResourceContents {
-            uri: uri.to_owned(),
-            mime_type: None,
-            text: body.to_owned(),
-        }],
-    }
+    ReadResourceResult::new(vec![
+        ResourceContents::text(body, uri).with_mime_type(MIME_TYPE),
+    ])
 }
 
 fn not_served(uri: &str) -> McpError {

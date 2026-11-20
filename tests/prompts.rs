@@ -11,7 +11,7 @@ use poc_rust_mcp::{
     resources::{HISTORY_URI, OPERATION_URI_PREFIX},
     server::OPERATIONS,
 };
-use rmcp::model::{GetPromptResult, JsonObject, PromptMessageContent};
+use rmcp::model::{ContentBlock, GetPromptResult, JsonObject};
 
 fn arguments(pairs: &[(&str, &str)]) -> JsonObject {
     pairs
@@ -27,7 +27,7 @@ fn text_of(result: &GetPromptResult) -> &str {
         .first()
         .expect("a prompt must produce a message");
     match &message.content {
-        PromptMessageContent::Text { text } => text,
+        ContentBlock::Text(text) => &text.text,
         other => panic!("expected text content, got {other:?}"),
     }
 }

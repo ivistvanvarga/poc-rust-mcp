@@ -2,7 +2,7 @@
 //! The MCP features beyond tools, driven through the real stdio transport.
 //!
 //! `tests/stdio_protocol.rs` covers protocol mechanics; this file proves each server-side feature
-//! rmcp 0.1.5 exposes is actually **reachable through the protocol** — which a unit test cannot
+//! the server advertises is actually **reachable through the protocol** — which a unit test cannot
 //! show, because a handler can be perfectly correct and never routed:
 //!
 //! | Feature | Method(s) | What is proved here |
@@ -217,13 +217,13 @@ async fn reading_the_history_resource_degrades_when_storage_is_off() {
         "the content should explain what to set, got {content}"
     );
 
-    // rmcp 0.1.5 serialises `ResourceContents` with an enum-level `rename_all`, which renames the
-    // variants but not the fields inside them, so a `mimeType` set here would reach the wire as
-    // `mime_type` — not a key in the MCP schema. The server therefore omits the optional field
-    // rather than emit it wrongly; this pins that, and would flag the day rmcp is upgraded.
+    // rmcp 3.x fixed the enum-level `rename_all` bug that used to emit `mime_type`; the media type
+    // now reaches the wire as the schema-correct `mimeType`. Pin the fix in the direction that
+    // matters, so a regression is caught rather than a workaround reintroduced.
+    assert_eq!(content["mimeType"], json!("text/plain"));
     assert!(
-        content.get("mimeType").is_none() && content.get("mime_type").is_none(),
-        "resources/read must omit the mis-serialised media type, got {content}"
+        content.get("mime_type").is_none(),
+        "resources/read must not emit the legacy mis-serialised key, got {content}"
     );
 }
 
